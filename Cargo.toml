@@ -1,0 +1,28 @@
+[package]
+name = "my-proxy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bench]]
+name = "rendezvous_hashing"
+harness = false
+
+[[bench]]
+name = "rate_limit"
+harness = false
+
+[dependencies]
+anyhow = "1.0.71"
+deadpool-redis = "0.12.0"
+once_cell = "1.17.1"
+rand = "0.8.5"
+redis = { version = "0.23.0", default-features = false, features = ["script"] }
+siphasher = "0.3.10"
+thiserror = "1.0.40"
+tokio = { version = "1.28.1", features = ["full"] }
+tower = { version = "0.4.13", features = ["balance", "util", "load", "discover"] }
+
+[dev-dependencies]
+criterion = { version = "0.4.0", default-features = false, features = ["async_tokio"] }
