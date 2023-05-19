@@ -48,13 +48,13 @@ mod tests {
         let client = deadpool_redis::Config::from_url("redis://127.0.0.1/").create_pool(None)?;
         let con = &mut client.get().await?;
         let key: &[u8; 20] = &thread_rng().gen();
-        rate_limit(con, key, 1, 500, 2).await?;
-        rate_limit(con, key, 1, 500, 2).await?;
-        let err = rate_limit(con, key, 1, 500, 2).await.unwrap_err();
+        rate_limit(con, key, 1, 100, 2).await?;
+        rate_limit(con, key, 1, 100, 2).await?;
+        let err = rate_limit(con, key, 1, 100, 2).await.unwrap_err();
         assert!(err.is::<RateLimitError>());
 
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        rate_limit(con, key, 1, 500, 2).await?;
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        rate_limit(con, key, 1, 100, 2).await?;
 
         Ok(())
     }
