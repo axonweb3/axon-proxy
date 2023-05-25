@@ -1,8 +1,13 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{ensure, Result};
+use arc_swap::ArcSwap;
 use deadpool_redis::{Pool, Runtime};
 use rand::{thread_rng, Rng};
+use reqwest::Client;
 use siphasher::sip::SipHasher;
 
 use crate::{
@@ -11,10 +16,14 @@ use crate::{
     rendezvous_hashing::WeightedRendezvousHashing,
 };
 
+pub type SharedContext = Arc<ArcSwap<Context>>;
+
 pub struct Context {
     pub bind: SocketAddr,
     pub rpc_nodes: WeightedRendezvousHashing<SipHasher, String>,
     pub ws_nodes: Vec<String>,
+    // Use reqwest/hyper connection pooling for now.
+    pub client: Client,
     pub pool: Pool,
     pub rate_limiting: Option<RateLimiting>,
 }
@@ -24,13 +33,7 @@ impl Context {
         ensure!(!config.nodes.is_empty());
         let pool = config.redis.create_pool(Some(Runtime::Tokio1))?;
         let ws_nodes = config.nodes.iter().flat_map(|n| n.ws.clone()).collect();
-        let key: [u8; 16] = blake2b_simd::Params::new()
-            .hash_length(16)
-            .hash(config.hash_key.as_bytes())
-            .as_bytes()
-            .try_into()
-            .unwrap();
-        let mut rpc_nodes = WeightedRendezvousHashing::new(SipHasher::new_with_key(&key));
+        let mut rpc_nodes = WeightedRendezvousHashing::new(SipHasher::new());
         for n in config.nodes {
             rpc_nodes.add(n.rpc, n.weight.unwrap_or(1.));
         }
@@ -38,12 +41,23 @@ impl Context {
             AddrOrPort::Port(p) => (Ipv4Addr::UNSPECIFIED, p).into(),
             AddrOrPort::Addr(a) => a,
         };
+        let client = Client::builder().pool_max_idle_per_host(100).build()?;
         Ok(Self {
             bind,
             rpc_nodes,
             ws_nodes,
+            client,
             pool,
             rate_limiting: config.rate_limiting,
+        })
+    }
+
+    /// Create a new context, reuse previous client.
+    pub fn from_config_and_previous(config: Config, previous: &Self) -> Result<Self> {
+        let new = Self::from_config(config)?;
+        Ok(Self {
+            client: previous.client.clone(),
+            ..new
         })
     }
 

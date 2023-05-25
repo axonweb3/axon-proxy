@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub nodes: Vec<Node>,
-    /// Consistent hashing key. Should have 128 bit of entropy.
-    pub hash_key: String,
+    /// Does not support reloading.
     pub bind: AddrOrPort,
     pub redis: deadpool_redis::Config,
     pub rate_limiting: Option<RateLimiting>,
@@ -30,7 +29,7 @@ pub struct Node {
     pub rpc: String,
     /// E.g. ws://host:80/
     pub ws: Option<String>,
-    /// Rpc load balancing weight. Does not affect ws.
+    /// Rpc load balancing weight. Default 1.0. Does not affect ws.
     pub weight: Option<f64>,
 }
 

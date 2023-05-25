@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[error("rate limit exceeded, retry in {retry_secs} seconds")]
 pub struct RateLimitError {
-    retry_secs: u64,
+    pub retry_secs: u64,
 }
 
 pub async fn rate_limit(
