@@ -3,20 +3,30 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use axum::{body::Bytes, http::header::CONTENT_TYPE};
+use blake3::Hasher;
 use jsonrpsee_types::{
     error::{
-        INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG, INVALID_REQUEST_CODE, INVALID_REQUEST_MSG,
-        PARSE_ERROR_CODE, PARSE_ERROR_MSG,
+        INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
+        INVALID_REQUEST_MSG, PARSE_ERROR_CODE, PARSE_ERROR_MSG,
     },
-    ErrorObject, Id, TwoPointZero,
+    ErrorObject, Id, Response, ResponsePayload, TwoPointZero,
 };
+use once_cell::sync::Lazy;
+use redis::{FromRedisValue, ToRedisArgs};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
+use thiserror::Error;
 
-use crate::{context::Context, redis::rate_limit::RateLimitError};
+use crate::{
+    context::Context,
+    redis::{
+        caching::{get_or_compute_coalesced, request_coalescing::RequestCoalescing},
+        rate_limit::RateLimitError,
+    },
+};
 
 pub const RATE_LIMIT_ERROR_CODE: i32 = -37001;
 
@@ -25,14 +35,14 @@ pub const APPLICATION_JSON: &str = "application/json";
 // Just Bytes but should have JSON content.
 pub type JsonBytes = Bytes;
 
-#[derive(Serialize)]
-struct ErrResponse<'a, Id> {
-    jsonrpc: TwoPointZero,
-    id: Id,
-    error: ErrorObject<'a>,
-}
-
 pub fn error_response<Id: Serialize>(id: Id, code: i32, message: &str) -> JsonBytes {
+    #[derive(Serialize)]
+    struct ErrResponse<'a, Id> {
+        jsonrpc: TwoPointZero,
+        id: Id,
+        error: ErrorObject<'a>,
+    }
+
     serde_json::to_vec(&ErrResponse {
         jsonrpc: TwoPointZero,
         id,
@@ -106,12 +116,23 @@ pub async fn handle_single_request(
         };
     }
 
-    if let Ok(Some(r)) = get_cached(ctx, &req).await {
-        return req.is_call().then_some(r);
+    let node = ctx.choose_rpc_node(ip);
+
+    if req.is_call() {
+        match cache_get_or_compute(ctx, node, &req, req_bytes.clone()).await {
+            Ok(r) => return Some(r),
+            Err(e) => {
+                if !e.is::<NotCached>() {
+                    log::warn!("failed to cache get or compute: {e}")
+                }
+            }
+        }
+    } else if req.method == "eth_call" || req.method == "eth_estimateGas" {
+        // Notifications that won't cause side-effects can be ignored.
+        return None;
     }
 
     // TODO: retry, circuit breaker, other LBs.
-    let node = ctx.choose_rpc_node(ip);
     let result = request(&ctx.client, node, req_bytes.clone()).await;
     if req.is_call() {
         Some(match result {
@@ -126,39 +147,198 @@ pub async fn handle_single_request(
     }
 }
 
-pub async fn request(client: &Client, url: &str, req: Bytes) -> Result<Bytes> {
+pub async fn request(client: &Client, url: &str, req: JsonBytes) -> Result<JsonBytes> {
     let response = client
         .post(url)
         .header(CONTENT_TYPE, APPLICATION_JSON)
         .body(req)
         .send()
         .await?
-        .error_for_status()?;
-    let is_json = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .map_or(false, |t| t == "application/json");
-    let body = response.bytes().await?;
-    if body.is_empty() || is_json {
-        // Trust the server to return valid json when content type is JSON.
-        return Ok(body);
+        .error_for_status()?
+        .bytes()
+        .await?;
+    if response.is_empty() {
+        return Ok(response);
     }
-    // Maybe the server forget to set content type.
-    if serde_json::from_slice::<&RawValue>(&body).is_err() {
-        if body.len() > 256 {
+    if serde_json::from_slice::<&RawValue>(&response).is_err() {
+        if response.len() > 256 {
             bail!("non-JSON response");
         } else {
-            let body_str = std::str::from_utf8(&body).unwrap_or("non-utf8 body");
+            let body_str = std::str::from_utf8(&response).unwrap_or("non-utf8 body");
             bail!("non-JSON response: {body_str}");
         }
     }
-    Ok(body)
+    Ok(response)
 }
 
-pub async fn get_cached(
-    _ctx: &Context,
-    _req: &CallOrNotification<'_>,
-) -> Result<Option<JsonBytes>> {
-    // TODO
-    Ok(None)
+// We are not interested in the actual value of quantities, so we just work with
+// the hex string.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CallObj<'a> {
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    from: Option<Cow<'a, str>>,
+
+    #[serde(borrow)]
+    to: Cow<'a, str>,
+
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    gas: Option<Cow<'a, str>>,
+
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    gas_price: Option<Cow<'a, str>>,
+
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    value: Option<Cow<'a, str>>,
+
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    data: Option<Cow<'a, str>>,
+
+    #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+    access_list: Option<Vec<AccessListItem<'a>>>,
+
+    #[serde(borrow, skip_serializing_if = "Option::is_none")]
+    max_priority_fee_per_gas: Option<Cow<'a, str>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AccessListItem<'a> {
+    #[serde(borrow)]
+    address: Cow<'a, str>,
+    #[serde(borrow)]
+    storage_keys: Vec<Cow<'a, str>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct EthCallParams<'a>(
+    #[serde(borrow)] CallObj<'a>,
+    #[serde(default, borrow, skip_serializing_if = "Option::is_none")] Option<Cow<'a, str>>,
+);
+
+fn parse_eth_call_params(params: Option<&RawValue>) -> Result<EthCallParams<'_>> {
+    let params = params.context("no params")?;
+    Ok(serde_json::from_str(params.get())?)
+}
+
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+struct CacheKey([u8; 32]);
+
+impl ToRedisArgs for CacheKey {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + redis::RedisWrite,
+    {
+        const PREFIX: &[u8; 8] = b"caching:";
+        let mut buf = [0u8; PREFIX.len() + 32];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        buf[PREFIX.len()..].copy_from_slice(&self.0);
+        out.write_arg(&buf);
+    }
+}
+
+#[derive(Clone)]
+struct CacheValue(JsonBytes);
+
+impl ToRedisArgs for CacheValue {
+    fn write_redis_args<W>(&self, out: &mut W)
+    where
+        W: ?Sized + redis::RedisWrite,
+    {
+        out.write_arg(&self.0);
+    }
+}
+
+impl FromRedisValue for CacheValue {
+    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
+        let vec: Vec<u8> = Vec::from_redis_value(v)?;
+        Ok(Self(vec.into()))
+    }
+}
+
+#[derive(Error, Debug)]
+#[error("method not cached")]
+struct NotCached;
+
+pub async fn cache_get_or_compute(
+    ctx: &Context,
+    node: &str,
+    req: &CallOrNotification<'_>,
+    req_bytes: JsonBytes,
+) -> Result<JsonBytes> {
+    static COALESCING: Lazy<RequestCoalescing<CacheKey, Result<CacheValue, JsonBytes>>> =
+        Lazy::new(RequestCoalescing::default);
+
+    let cache_key = if ctx.cache.eth_call && req.method == "eth_call"
+        || ctx.cache.eth_estimate_gas && req.method == "eth_estimateGas"
+    {
+        // De-serialize and re-serialize so that cache key is not affected by serialization differences.
+        let params = match parse_eth_call_params(req.params) {
+            Ok(p) => p,
+            Err(e) => return Ok(error_response(&req.id, INVALID_PARAMS_CODE, &e.to_string())),
+        };
+        let tip = get_tip_block_hash(ctx, node).await?;
+        let params_json = serde_json::value::to_raw_value(&params)?;
+        // Use blake3(tip_block_hash || method || params) as cache key.
+        let cache_key = Hasher::new()
+            .update(tip.as_bytes())
+            .update(req.method.as_bytes())
+            .update(params_json.get().as_bytes())
+            .finalize();
+        CacheKey(*cache_key.as_bytes())
+    } else {
+        bail!(NotCached)
+    };
+    let r = get_or_compute_coalesced(
+        &ctx.pool,
+        &COALESCING,
+        cache_key,
+        ctx.cache.expire_milliseconds,
+        async {
+            request(&ctx.client, node, req_bytes)
+                .await
+                .map(CacheValue)
+                .map_err(|e| {
+                    // Transient errors are not cached.
+                    log::warn!("Error forwarding request: {e}");
+                    error_response(Id::Null, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG)
+                })
+        },
+    )
+    .await?;
+    let r = match r {
+        Ok(r) => r.0,
+        Err(e) => e,
+    };
+    // Change (cached or coalesced) response id to request id.
+    let mut r: Value = serde_json::from_slice(&r)?;
+    ensure!(r.is_object());
+    r["id"] = serde_json::to_value(&req.id)?;
+    Ok(r.to_string().into())
+}
+
+pub async fn get_tip_block_hash(ctx: &Context, node: &str) -> Result<String> {
+    let result = ctx
+        .client
+        .post(node)
+        .header(CONTENT_TYPE, APPLICATION_JSON)
+        .body(
+            r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","id":1,"params":["latest",false]}"#,
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    #[derive(Deserialize, Clone)]
+    struct GetBlockResult {
+        #[serde(rename = "blockHash")]
+        block_hash: String,
+    }
+    let result: Response<GetBlockResult> = serde_json::from_slice(&result)?;
+    match result.payload {
+        ResponsePayload::Result(r) => Ok(r.into_owned().block_hash),
+        ResponsePayload::Error(e) => bail!("{}", e),
+    }
 }

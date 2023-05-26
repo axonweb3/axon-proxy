@@ -30,7 +30,11 @@ pub async fn serve(ctx: SharedContext) -> Result<()> {
         .with_state(ctx)
         .layer(CompressionLayer::new())
         .layer(TimeoutLayer::new(Duration::from_secs(30)))
-        .layer(CorsLayer::permissive().max_age(Duration::from_secs(300)));
+        .layer(
+            CorsLayer::permissive()
+                .vary([])
+                .max_age(Duration::from_secs(300)),
+        );
     log::info!("binding to {}", bind);
     axum::Server::bind(&bind)
         .tcp_nodelay(true)

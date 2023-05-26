@@ -12,7 +12,9 @@ pub struct Config {
     /// Does not support reloading.
     pub bind: AddrOrPort,
     pub redis: deadpool_redis::Config,
-    pub rate_limiting: Option<RateLimiting>,
+    pub rate_limit: Option<RateLimit>,
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -35,11 +37,32 @@ pub struct Node {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
-pub struct RateLimiting {
+pub struct RateLimit {
     /// Limit per IP per minute.
     pub total: u32,
     /// Limit per IP per minute of some method.
-    pub methods: HashMap<String, u32>,
+    #[serde(default)]
+    pub method: HashMap<String, u32>,
     /// Specific setttings for IPs.
-    pub ips: HashMap<Ipv4Addr, Box<RateLimiting>>,
+    #[serde(default)]
+    pub ip: HashMap<Ipv4Addr, Box<RateLimit>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    pub expire_milliseconds: u64,
+    pub eth_call: bool,
+    #[serde(rename = "eth_estimateGas")]
+    pub eth_estimate_gas: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            expire_milliseconds: 30_000,
+            eth_call: false,
+            eth_estimate_gas: false,
+        }
+    }
 }

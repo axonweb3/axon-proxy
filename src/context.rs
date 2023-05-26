@@ -11,7 +11,7 @@ use reqwest::Client;
 use siphasher::sip::SipHasher;
 
 use crate::{
-    config::{AddrOrPort, Config, RateLimiting},
+    config::{AddrOrPort, CacheConfig, Config, RateLimit},
     redis::rate_limit::rate_limit,
     rendezvous_hashing::WeightedRendezvousHashing,
 };
@@ -25,7 +25,8 @@ pub struct Context {
     // Use reqwest/hyper connection pooling for now.
     pub client: Client,
     pub pool: Pool,
-    pub rate_limiting: Option<RateLimiting>,
+    pub rate_limiting: Option<RateLimit>,
+    pub cache: CacheConfig,
 }
 
 impl Context {
@@ -48,7 +49,8 @@ impl Context {
             ws_nodes,
             client,
             pool,
-            rate_limiting: config.rate_limiting,
+            rate_limiting: config.rate_limit,
+            cache: config.cache,
         })
     }
 
@@ -63,7 +65,7 @@ impl Context {
 
     pub async fn rate_limit(&self, ip: Ipv4Addr, method: &str) -> Result<()> {
         if let Some(ref rl) = self.rate_limiting {
-            let rl = rl.ips.get(&ip).map(|r| &**r).unwrap_or(rl);
+            let rl = rl.ip.get(&ip).map(|r| &**r).unwrap_or(rl);
 
             let total_limit = rl.total;
 
@@ -77,7 +79,7 @@ impl Context {
             )
             .await?;
 
-            if let Some(method_limit) = rl.methods.get(method).cloned() {
+            if let Some(method_limit) = rl.method.get(method).cloned() {
                 rate_limit(
                     &mut con,
                     format!("rate_limit:{ip}:{method}"),
