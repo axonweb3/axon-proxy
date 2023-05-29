@@ -28,7 +28,10 @@ use crate::{
     },
 };
 
+use super::ws::LazySocket;
+
 pub const RATE_LIMIT_ERROR_CODE: i32 = -37001;
+pub const SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE: i32 = -37002;
 
 pub const APPLICATION_JSON: &str = "application/json";
 
@@ -85,10 +88,18 @@ impl CallOrNotification<'_> {
     }
 }
 
+pub enum OnSubscription<'a> {
+    ErrorHttp,
+    ErrorWsBatch,
+    ForwardWs(&'a mut LazySocket),
+}
+
+/// Result is valid UTF-8.
 pub async fn handle_single_request(
     ctx: &Context,
     ip: IpAddr,
     req_bytes: Bytes,
+    on_subscription: OnSubscription<'_>,
 ) -> Option<JsonBytes> {
     let Ok(req) = serde_json::from_slice::<CallOrNotification>(&req_bytes) else {
         return Some(invalid_request_or_parse_error(&req_bytes));
@@ -119,6 +130,38 @@ pub async fn handle_single_request(
     let node = ctx.choose_rpc_node(ip);
 
     if req.is_call() {
+        if req.method == "eth_subscribe" || req.method == "eth_unsubscribe" {
+            match on_subscription {
+                OnSubscription::ErrorWsBatch => {
+                    return Some(error_response(
+                        req.id,
+                        SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                        "subscription in batch request is not supported",
+                    ));
+                }
+                OnSubscription::ErrorHttp => {
+                    return Some(error_response(
+                        req.id,
+                        SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                        "subscription over http is not supported",
+                    ));
+                }
+                OnSubscription::ForwardWs(upstream) => {
+                    // Clone id and drop req to make the borrow checker happy.
+                    let id = serde_json::to_value(&req.id).unwrap_or(Value::Null);
+                    drop(req);
+                    // Safety: safe because req_bytes is JSON => req_bytes is utf-8.
+                    let req_str = unsafe { String::from_utf8_unchecked(req_bytes.into()) };
+                    // Just forward to upstream socket, the response is forwarded by the ws handling loop.
+                    if let Err(e) = upstream.send(ctx, req_str.into()).await {
+                        // Return an error if connecting/forwarding to upstream fails.
+                        return Some(error_response(&id, INTERNAL_ERROR_CODE, &e.to_string()));
+                    }
+                    return None;
+                }
+            }
+        }
+
         match cache_get_or_compute(ctx, node, &req, req_bytes.clone()).await {
             Ok(r) => return Some(r),
             Err(e) => {
@@ -127,8 +170,13 @@ pub async fn handle_single_request(
                 }
             }
         }
-    } else if req.method == "eth_call" || req.method == "eth_estimateGas" {
+    } else if req.method == "eth_call"
+        || req.method == "eth_estimateGas"
+        || req.method == "eth_subscribe"
+        || req.method == "eth_unsubscribe"
+    {
         // Notifications that won't cause side-effects can be ignored.
+        // Subscription notification is ignored.
         return None;
     }
 
@@ -147,6 +195,7 @@ pub async fn handle_single_request(
     }
 }
 
+/// Full jsonrpc request -> response.
 pub async fn request(client: &Client, url: &str, req: JsonBytes) -> Result<JsonBytes> {
     let response = client
         .post(url)
@@ -164,7 +213,7 @@ pub async fn request(client: &Client, url: &str, req: JsonBytes) -> Result<JsonB
         if response.len() > 256 {
             bail!("non-JSON response");
         } else {
-            let body_str = std::str::from_utf8(&response).unwrap_or("non-utf8 body");
+            let body_str = std::str::from_utf8(&response).unwrap_or("non utf-8 response");
             bail!("non-JSON response: {body_str}");
         }
     }

@@ -1,6 +1,8 @@
 use std::{net::IpAddr, time::Duration};
 
+use anyhow::{Context as _, Result};
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
@@ -8,10 +10,20 @@ use axum::{
     response::IntoResponse,
 };
 use futures::prelude::*;
-use tokio::time::Instant;
+use itertools::intersperse;
+use jsonrpsee_types::error::{INVALID_REQUEST_CODE, INVALID_REQUEST_MSG};
+use serde_json::value::{RawValue, Value};
+use tokio::{net::TcpStream, time::Instant};
+use tokio_tungstenite::{tungstenite, MaybeTlsStream, WebSocketStream};
 
-use super::client_ip::ClientIp;
-use crate::context::SharedContext;
+use super::{
+    client_ip::ClientIp,
+    common::{JsonBytes, OnSubscription},
+};
+use crate::{
+    context::{Context, SharedContext},
+    server::common::{error_response, handle_single_request},
+};
 
 pub async fn ws_handler(
     State(ctx): State<SharedContext>,
@@ -24,11 +36,37 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| real_ws_handler(ctx, ip, socket))
 }
 
-async fn real_ws_handler(_ctx: SharedContext, _ip: IpAddr, socket: WebSocket) {
-    let (mut sock_tx, mut sock_rx) = socket.split();
+pub struct LazySocket {
+    socket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+}
 
+impl LazySocket {
+    pub fn is_connected(&self) -> bool {
+        self.socket.is_some()
+    }
+    pub async fn recv(&mut self) -> Result<Option<tungstenite::Message>> {
+        if let Some(ref mut socket) = self.socket {
+            Ok(socket.next().await.transpose()?)
+        } else {
+            Ok(None)
+        }
+    }
+    pub async fn send(&mut self, ctx: &Context, msg: tungstenite::Message) -> Result<()> {
+        if self.socket.is_none() {
+            let url = ctx.choose_ws_node().context("no ws nodes")?;
+            self.socket = Some(tokio_tungstenite::connect_async(url).await?.0);
+        }
+        self.socket.as_mut().unwrap().send(msg).await?;
+        Ok(())
+    }
+}
+
+async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) {
     let dead_timer = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(dead_timer);
+
+    // TODO?: upstream keepalive. Maybe not necessary because upstream will ping us.
+    let mut upstream = LazySocket { socket: None };
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(19));
     ping_interval.reset();
@@ -36,18 +74,24 @@ async fn real_ws_handler(_ctx: SharedContext, _ip: IpAddr, socket: WebSocket) {
 
     loop {
         tokio::select! {
-            msg = sock_rx.next() => {
+            msg = socket.next() => {
                 dead_timer.as_mut().reset(Instant::now() + Duration::from_secs(60));
                 ping_interval.reset();
                 match msg {
                     Some(Ok(msg)) => {
                         match msg {
-                            Message::Text(_msg) => {
-                                // TODO: Subscription requests must be proxied. Other requests are handled same as HTTP.
+                            Message::Text(msg) => {
+                                if let Some(resp) = handle_ws_msg(&ctx.load(), &mut upstream, ip, msg).await {
+                                    // Safety: safe becuase response is UTF-8.
+                                    let resp = unsafe { String::from_utf8_unchecked(resp.into()) };
+                                    if socket.send(Message::Text(resp)).await.is_err() {
+                                        break;
+                                    }
+                                }
                             }
                             Message::Close(_) => break,
                             Message::Ping(m) => {
-                                if sock_tx.send(Message::Pong(m)).await.is_err() {
+                                if socket.send(Message::Pong(m)).await.is_err() {
                                     break;
                                 }
                             }
@@ -59,14 +103,77 @@ async fn real_ws_handler(_ctx: SharedContext, _ip: IpAddr, socket: WebSocket) {
                     _ => break,
                 }
             }
+            msg = upstream.recv(), if upstream.is_connected() => {
+                match msg {
+                    Ok(Some(tungstenite::Message::Text(msg))) => {
+                        if socket.send(msg.into()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(tungstenite::Message::Ping(m))) => {
+                        if upstream.send(&ctx.load(), tungstenite::Message::Pong(m)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(tungstenite::Message::Close(_))) => break,
+                    // Other messages can be ignored.
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        log::warn!("upstream recv error: {e}");
+                        break;
+                    }
+                }
+            }
             _ = &mut dead_timer => {
                 break;
             }
             _ = ping_interval.tick() => {
-                if sock_tx.send(Message::Ping(vec![])).await.is_err() {
+                if socket.send(Message::Ping(vec![])).await.is_err() {
                     break;
                 }
             }
         }
+    }
+}
+
+/// Result is valid UTF-8.
+async fn handle_ws_msg(
+    ctx: &Context,
+    upstream: &mut LazySocket,
+    ip: IpAddr,
+    msg: String,
+) -> Option<JsonBytes> {
+    let msg: Bytes = msg.into();
+    if let Ok(reqs) = serde_json::from_slice::<Vec<&RawValue>>(&msg) {
+        if reqs.is_empty() {
+            return Some(error_response(
+                &Value::Null,
+                INVALID_REQUEST_CODE,
+                INVALID_REQUEST_MSG,
+            ));
+        }
+        let mut results = Vec::with_capacity(reqs.len());
+        for raw_req in &reqs {
+            let req_bytes = raw_req.get().to_string().into();
+            if let Some(res) =
+                handle_single_request(ctx, ip, req_bytes, OnSubscription::ErrorWsBatch).await
+            {
+                results.push(res);
+            }
+        }
+        if !results.is_empty() {
+            let mut result = Vec::with_capacity(
+                results.iter().map(|r| r.len()).sum::<usize>() + results.len() + 1,
+            );
+            for x in intersperse(results.iter().map(|r| &**r), b",") {
+                result.extend_from_slice(x);
+            }
+            Some(result.into())
+        } else {
+            None
+        }
+    } else {
+        handle_single_request(ctx, ip, msg, OnSubscription::ForwardWs(upstream)).await
     }
 }
