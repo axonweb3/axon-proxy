@@ -1,6 +1,10 @@
 pub mod request_coalescing;
 
-use std::{future::IntoFuture, hash::Hash};
+use std::{
+    future::IntoFuture,
+    hash::Hash,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use deadpool_redis::Pool;
@@ -40,9 +44,9 @@ where
 
 /// Get cached value or compute it with in-process request coalescing.
 ///
-/// Return Ok(Ok(o)) if cache hit.
+/// Returns Err(_) on redis error.
 ///
-/// Otherwise return coalesced computing result.
+/// If cache is not hit, this returns a coalesced computing result.
 ///
 /// Cache is set if compute returns Ok, and not set if compute returns Err.
 pub async fn get_or_compute_coalesced<K, O, F, E>(
@@ -65,14 +69,18 @@ where
 
         match coalescing.get(key.clone()) {
             CoalescingResult::Sender(tx) => {
+                let removed = AtomicBool::new(false);
+                // Remove it even if compute panics.
                 defer! {
-                    coalescing.remove(&key);
+                    if !removed.load(Ordering::Relaxed) {
+                        coalescing.remove(&key);
+                    }
                 }
                 let result = compute.await;
 
                 // Set cache if result is Ok.
                 if let (Ok(mut con), Ok(o)) = (pool.get().await, &result) {
-                    // Ignore error setting cache and broadcasting.
+                    // Ignore error setting cache.
                     let _ = redis::cmd("set")
                         .arg(&key)
                         .arg(o)
@@ -81,6 +89,10 @@ where
                         .query_async::<_, String>(&mut con)
                         .await;
                 }
+                // Remove before sending, so others won't subscribe to us after
+                // the result is sent.
+                coalescing.remove(&key);
+                removed.store(true, Ordering::Relaxed);
                 let _ = tx.send(result.clone());
 
                 return Ok(result);
@@ -96,38 +108,68 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use anyhow::ensure;
     use rand::{thread_rng, Rng};
 
     use super::*;
 
+    fn gen_key() -> Vec<u8> {
+        let key: [u8; 20] = thread_rng().gen();
+        key.into()
+    }
+
     #[tokio::test]
     async fn test_coalesced() -> Result<()> {
+        // Cached and coalesced.
         let pool = deadpool_redis::Config::from_url("redis://127.0.0.1/").create_pool(None)?;
-        let col = RequestCoalescing::default();
-        let key: [u8; 20] = thread_rng().gen();
-        let g1 = get_or_compute_coalesced(&pool, &col, &key, 1000, async {
+        let col = Arc::new(RequestCoalescing::default());
+        let key: Vec<u8> = gen_key();
+        let g1 = get_or_compute_coalesced(&pool, &col, key.clone(), 1000, async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Ok::<_, i32>(3)
         });
-        let g2 = get_or_compute_coalesced(&pool, &col, &key, 1000, async {
+        let g2 = get_or_compute_coalesced(&pool, &col, key.clone(), 1000, async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Ok::<_, i32>(4)
         });
         let (v1, v2) = tokio::try_join!(g1, g2)?;
         ensure!(v1 == v2);
         ensure!(col.is_empty());
+        ensure!(pool.get().await?.exists(key).await?);
 
-        let key: [u8; 20] = thread_rng().gen();
-        let g3 = get_or_compute_coalesced(&pool, &col, &key, 1000, async {
+        // Coalesced but not cached.
+        let key: Vec<u8> = gen_key();
+        let g3 = get_or_compute_coalesced(&pool, &col, key.clone(), 1000, async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Err::<i32, i32>(4)
-        })
-        .await?;
-        ensure!(g3 == Err(4));
-        ensure!(!pool.get().await?.exists(&key).await?);
+        });
+        let g4 = get_or_compute_coalesced(&pool, &col, key.clone(), 1000, async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err::<i32, i32>(5)
+        });
+        let (v3, v4) = tokio::try_join!(g3, g4)?;
+        ensure!(v3 == v4);
+        ensure!(v3.is_err());
+        ensure!(!pool.get().await?.exists(key).await?);
+
+        // If the compute future panics, the coalescing entry is still removed.
+        let col1 = col.clone();
+        let t = tokio::spawn(async move {
+            let key: Vec<u8> = gen_key();
+            get_or_compute_coalesced(&pool, &col1, key, 1000, async {
+                if true {
+                    panic!("panic");
+                }
+                Ok::<i32, i32>(1)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        });
+        ensure!(t.await.is_err());
+        ensure!(col.is_empty());
 
         Ok(())
     }
