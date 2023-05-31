@@ -140,6 +140,8 @@ pub async fn handle_single_request(
 
     let node = ctx.choose_rpc_node(ip);
 
+    log::info!("{} {}", ip, req.method);
+
     if req.is_call() {
         if req.method == "eth_subscribe" || req.method == "eth_unsubscribe" {
             match on_subscription {
