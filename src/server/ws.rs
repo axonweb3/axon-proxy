@@ -62,6 +62,8 @@ impl LazySocket {
 }
 
 async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) {
+    ctx.load().metrics.ws_accepted.inc();
+
     let dead_timer = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(dead_timer);
 
@@ -79,14 +81,17 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                 ping_interval.reset();
                 match msg {
                     Some(Ok(msg)) => {
+                        let ctx = ctx.load();
+                        ctx.metrics.ws_message_received.inc();
                         match msg {
                             Message::Text(msg) => {
-                                if let Some(resp) = handle_ws_msg(&ctx.load(), &mut upstream, ip, msg).await {
+                                if let Some(resp) = handle_ws_msg(&ctx, &mut upstream, ip, msg).await {
                                     // Safety: safe becuase response is UTF-8.
                                     let resp = unsafe { String::from_utf8_unchecked(resp.into()) };
                                     if socket.send(Message::Text(resp)).await.is_err() {
                                         break;
                                     }
+                                    ctx.metrics.ws_message_sent.inc();
                                 }
                             }
                             Message::Close(_) => break,
@@ -94,6 +99,7 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                                 if socket.send(Message::Pong(m)).await.is_err() {
                                     break;
                                 }
+                                ctx.metrics.ws_message_sent.inc();
                             }
                             // Binary messages are ignored.
                             _ => {}
@@ -109,6 +115,8 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                         if socket.send(msg.into()).await.is_err() {
                             break;
                         }
+                        let ctx = ctx.load();
+                        ctx.metrics.ws_message_sent.inc();
                     }
                     Ok(Some(tungstenite::Message::Ping(m))) => {
                         if upstream.send(&ctx.load(), tungstenite::Message::Pong(m)).await.is_err() {
@@ -132,6 +140,7 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                 if socket.send(Message::Ping(vec![])).await.is_err() {
                     break;
                 }
+                ctx.load().metrics.ws_message_sent.inc();
             }
         }
     }

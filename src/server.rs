@@ -8,7 +8,7 @@ use std::{future::Future, net::SocketAddr, time::Duration};
 use anyhow::Result;
 use axum::{
     extract::{OriginalUri, State},
-    http::HeaderMap,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::*,
     Json,
@@ -47,11 +47,34 @@ pub async fn serve(ctx: SharedContext) -> Result<()> {
     Ok(())
 }
 
-async fn metrics_handler(State(_ctx): State<SharedContext>) -> impl IntoResponse {
-    todo!()
+async fn metrics_handler(State(ctx): State<SharedContext>) -> impl IntoResponse {
+    let ctx = ctx.load();
+    ctx.metrics.http_requests.inc();
+
+    let mut buf = String::with_capacity(2048);
+    if let Err(err) = prometheus_client::encoding::text::encode(&mut buf, &ctx.metrics_registry) {
+        log::warn!("failed to scrape metrics: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    (
+        [(
+            CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        buf,
+    )
+        .into_response()
 }
 
-async fn debug(uri: OriginalUri, headers: HeaderMap, ip: ClientIp) -> impl IntoResponse {
+async fn debug(
+    State(ctx): State<SharedContext>,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    ip: ClientIp,
+) -> impl IntoResponse {
+    let ctx = ctx.load();
+    ctx.metrics.http_requests.inc();
+
     let headers = Map::from_iter(
         headers
             .into_iter()

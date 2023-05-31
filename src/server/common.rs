@@ -16,9 +16,11 @@ use jsonrpsee_types::{
 use once_cell::sync::Lazy;
 use redis::{FromRedisValue, ToRedisArgs};
 use reqwest::Client;
+use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use thiserror::Error;
+use tokio::time::Instant;
 
 use crate::{
     context::Context,
@@ -101,6 +103,12 @@ pub async fn handle_single_request(
     req_bytes: Bytes,
     on_subscription: OnSubscription<'_>,
 ) -> Option<JsonBytes> {
+    ctx.metrics.rpc_requests.inc();
+    let start = Instant::now();
+    defer! {
+        ctx.metrics.rpc_response_time.observe(start.elapsed().as_secs_f64());
+    };
+
     let Ok(req) = serde_json::from_slice::<CallOrNotification>(&req_bytes) else {
         return Some(invalid_request_or_parse_error(&req_bytes));
     };
@@ -115,7 +123,10 @@ pub async fn handle_single_request(
     if let Err(err) = ctx.rate_limit(ip, &req.method).await {
         return if req.is_call() {
             let (code, msg) = match err.downcast_ref::<RateLimitError>() {
-                Some(err) => (RATE_LIMIT_ERROR_CODE, err.to_string()),
+                Some(err) => {
+                    ctx.metrics.rpc_rate_limited.inc();
+                    (RATE_LIMIT_ERROR_CODE, err.to_string())
+                }
                 None => {
                     log::warn!("rate limit error: {err}");
                     (INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG.into())
@@ -339,12 +350,14 @@ pub async fn cache_get_or_compute(
     } else {
         bail!(NotCached)
     };
+    let mut computed = false;
     let r = get_or_compute_coalesced(
         &ctx.pool,
         &COALESCING,
         cache_key,
         ctx.cache.expire_milliseconds,
         async {
+            computed = true;
             request(&ctx.client, node, req_bytes)
                 .await
                 .map(CacheValue)
@@ -356,6 +369,11 @@ pub async fn cache_get_or_compute(
         },
     )
     .await?;
+    if computed {
+        ctx.metrics.cache_miss.inc();
+    } else {
+        ctx.metrics.cache_hit.inc();
+    }
     let r = match r {
         Ok(r) => r.0,
         Err(e) => e,
