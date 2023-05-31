@@ -1,15 +1,11 @@
 pub mod request_coalescing;
 
-use std::{
-    future::IntoFuture,
-    hash::Hash,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{future::IntoFuture, hash::Hash};
 
 use anyhow::Result;
 use deadpool_redis::Pool;
 use redis::{aio::Connection, AsyncCommands, FromRedisValue, ToRedisArgs};
-use scopeguard::defer;
+use scopeguard::guard;
 
 use self::request_coalescing::{CoalescingResult, RequestCoalescing};
 
@@ -69,13 +65,9 @@ where
 
         match coalescing.get(key.clone()) {
             CoalescingResult::Sender(tx) => {
-                let removed = AtomicBool::new(false);
-                // Remove it even if compute panics.
-                defer! {
-                    if !removed.load(Ordering::Relaxed) {
-                        coalescing.remove(&key);
-                    }
-                }
+                let remove_guard = guard((), |_| {
+                    coalescing.remove(&key);
+                });
                 let result = compute.await;
 
                 // Set cache if result is Ok.
@@ -91,8 +83,7 @@ where
                 }
                 // Remove before sending, so others won't subscribe to us after
                 // the result is sent.
-                coalescing.remove(&key);
-                removed.store(true, Ordering::Relaxed);
+                drop(remove_guard);
                 let _ = tx.send(result.clone());
 
                 return Ok(result);
