@@ -15,6 +15,12 @@ pub struct Config {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default = "default_filter_ttl_secs")]
+    pub filter_ttl_secs: usize,
+}
+
+fn default_filter_ttl_secs() -> usize {
+    90
 }
 
 #[derive(Serialize, Deserialize, Debug)]

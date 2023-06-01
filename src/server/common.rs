@@ -14,8 +14,7 @@ use jsonrpsee_types::{
     ErrorObject, Id, Response, ResponsePayload, TwoPointZero,
 };
 use once_cell::sync::Lazy;
-use redis::{FromRedisValue, ToRedisArgs};
-use reqwest::Client;
+use redis::{AsyncCommands, Expiry, FromRedisValue, ToRedisArgs};
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -34,6 +33,7 @@ use super::ws::LazySocket;
 
 pub const RATE_LIMIT_ERROR_CODE: i32 = -37001;
 pub const SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE: i32 = -37002;
+pub const FILTER_ID_NOT_FOUND_ERROR_CODE: i32 = -37003;
 
 pub const APPLICATION_JSON: &str = "application/json";
 
@@ -138,44 +138,82 @@ pub async fn handle_single_request(
         };
     }
 
-    let node = ctx.choose_rpc_node(ip);
+    // For filter methods, get node from redis.
+    let node: Cow<str> = if req.method == "eth_getFilterChanges"
+        || req.method == "eth_getFilterLogs"
+        || req.method == "eth_uninstallFilter"
+    {
+        let filter_id = match get_filter_id(&req) {
+            Ok(filter_id) => filter_id,
+            Err(e) => {
+                return req
+                    .is_call()
+                    .then(|| error_response(req.id, INVALID_PARAMS_CODE, &e.to_string()))
+            }
+        };
+        match get_node_by_filter_id(ctx, &filter_id).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                return req.is_call().then(|| {
+                    error_response(
+                        req.id,
+                        FILTER_ID_NOT_FOUND_ERROR_CODE,
+                        "filter id not found",
+                    )
+                });
+            }
+            Err(e) => {
+                log::warn!("failed to get filter id: {e}");
+                return req
+                    .is_call()
+                    .then(|| error_response(req.id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG));
+            }
+        }
+        .into()
+    } else {
+        ctx.choose_rpc_node(ip).into()
+    };
 
     log::info!("{} {}", ip, req.method);
 
-    if req.is_call() {
-        if req.method == "eth_subscribe" || req.method == "eth_unsubscribe" {
-            match on_subscription {
-                OnSubscription::ErrorWsBatch => {
-                    return Some(error_response(
-                        req.id,
-                        SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
-                        "subscription in batch request is not supported",
-                    ));
+    let is_new_filter = req.method == "eth_newFilter"
+        || req.method == "eth_newBlockFilter"
+        || req.method == "eth_newPendingTransactionFilter";
+
+    if req.method == "eth_subscribe" || req.method == "eth_unsubscribe" {
+        match on_subscription {
+            OnSubscription::ErrorWsBatch => {
+                return Some(error_response(
+                    req.id,
+                    SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                    "subscription in batch request is not supported",
+                ));
+            }
+            OnSubscription::ErrorHttp => {
+                return Some(error_response(
+                    req.id,
+                    SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                    "subscription over http is not supported",
+                ));
+            }
+            OnSubscription::ForwardWs(upstream) => {
+                // Clone id and drop req to make the borrow checker happy.
+                let id = serde_json::to_value(&req.id).unwrap_or(Value::Null);
+                drop(req);
+                // Safety: safe because req_bytes is JSON => req_bytes is utf-8.
+                let req_str = unsafe { String::from_utf8_unchecked(req_bytes.into()) };
+                // Just forward to upstream socket, the response is forwarded by the ws handling loop.
+                if let Err(e) = upstream.send(ctx, req_str.into()).await {
+                    // Return an error if connecting/forwarding to upstream fails.
+                    return Some(error_response(&id, INTERNAL_ERROR_CODE, &e.to_string()));
                 }
-                OnSubscription::ErrorHttp => {
-                    return Some(error_response(
-                        req.id,
-                        SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
-                        "subscription over http is not supported",
-                    ));
-                }
-                OnSubscription::ForwardWs(upstream) => {
-                    // Clone id and drop req to make the borrow checker happy.
-                    let id = serde_json::to_value(&req.id).unwrap_or(Value::Null);
-                    drop(req);
-                    // Safety: safe because req_bytes is JSON => req_bytes is utf-8.
-                    let req_str = unsafe { String::from_utf8_unchecked(req_bytes.into()) };
-                    // Just forward to upstream socket, the response is forwarded by the ws handling loop.
-                    if let Err(e) = upstream.send(ctx, req_str.into()).await {
-                        // Return an error if connecting/forwarding to upstream fails.
-                        return Some(error_response(&id, INTERNAL_ERROR_CODE, &e.to_string()));
-                    }
-                    return None;
-                }
+                return None;
             }
         }
+    }
 
-        match cache_get_or_compute(ctx, node, &req, req_bytes.clone()).await {
+    if req.is_call() {
+        match cache_get_or_compute(ctx, &node, &req, req_bytes.clone()).await {
             Ok(r) => return Some(r),
             Err(e) => {
                 if !e.is::<NotCached>() {
@@ -183,18 +221,16 @@ pub async fn handle_single_request(
                 }
             }
         }
-    } else if req.method == "eth_call"
-        || req.method == "eth_estimateGas"
-        || req.method == "eth_subscribe"
-        || req.method == "eth_unsubscribe"
-    {
-        // Notifications that won't cause side-effects can be ignored.
-        // Subscription notification is ignored.
+    } else if req.method == "eth_call" || req.method == "eth_estimateGas" || is_new_filter {
+        // eth_call / eth_estimateGas notifications are ignored.
+        //
+        // New filter notifications can be ignored because no one will know the
+        // filter ID if the filter is created.
         return None;
     }
 
     // TODO: retry, circuit breaker, other LBs.
-    let result = request(&ctx.client, node, req_bytes.clone()).await;
+    let result = request(ctx, &node, req_bytes.clone(), is_new_filter).await;
     if req.is_call() {
         Some(match result {
             Ok(v) => v,
@@ -209,9 +245,17 @@ pub async fn handle_single_request(
 }
 
 /// Full jsonrpc request -> response.
-pub async fn request(client: &Client, url: &str, req: JsonBytes) -> Result<JsonBytes> {
-    let response = client
-        .post(url)
+///
+/// If the request creates a new filter, the filter id -> node mapping is saved in redis.
+pub async fn request(
+    ctx: &Context,
+    node: &str,
+    req: JsonBytes,
+    is_new_filter: bool,
+) -> Result<JsonBytes> {
+    let response = ctx
+        .client
+        .post(node)
         .header(CONTENT_TYPE, APPLICATION_JSON)
         .body(req)
         .send()
@@ -222,15 +266,28 @@ pub async fn request(client: &Client, url: &str, req: JsonBytes) -> Result<JsonB
     if response.is_empty() {
         return Ok(response);
     }
-    if serde_json::from_slice::<&RawValue>(&response).is_err() {
-        if response.len() > 256 {
-            bail!("non-JSON response");
-        } else {
-            let body_str = std::str::from_utf8(&response).unwrap_or("non utf-8 response");
-            bail!("non-JSON response: {body_str}");
+
+    if is_new_filter {
+        let response_json = serde_json::from_slice::<Value>(&response)?;
+        if let Some(filter_id) = response_json["result"].as_str() {
+            ctx.pool
+                .get()
+                .await?
+                .set_ex(format!("filter:{filter_id}"), node, ctx.filter_ttl_secs)
+                .await?;
         }
+        Ok(response)
+    } else {
+        if serde_json::from_slice::<&RawValue>(&response).is_err() {
+            if response.len() > 256 {
+                bail!("non-JSON response");
+            } else {
+                let body_str = std::str::from_utf8(&response).unwrap_or("non utf-8 response");
+                bail!("non-JSON response: {body_str}");
+            }
+        }
+        Ok(response)
     }
-    Ok(response)
 }
 
 // We are not interested in the actual value of quantities, so we just work with
@@ -360,7 +417,7 @@ pub async fn cache_get_or_compute(
         ctx.cache.expire_milliseconds,
         async {
             computed = true;
-            request(&ctx.client, node, req_bytes)
+            request(ctx, node, req_bytes, false)
                 .await
                 .map(CacheValue)
                 .map_err(|e| {
@@ -410,4 +467,22 @@ pub async fn get_tip_block_hash(ctx: &Context, node: &str) -> Result<String> {
         ResponsePayload::Result(r) => Ok(r.into_owned().block_hash),
         ResponsePayload::Error(e) => bail!("{}", e),
     }
+}
+
+fn get_filter_id(req: &CallOrNotification) -> Result<String> {
+    let (filter_id,): (String,) = serde_json::from_str(req.params.context("no params")?.get())?;
+    Ok(filter_id)
+}
+
+async fn get_node_by_filter_id(ctx: &Context, filter_id: &str) -> Result<Option<String>> {
+    let node = ctx
+        .pool
+        .get()
+        .await?
+        .get_ex(
+            format!("filter:{filter_id}"),
+            Expiry::EX(ctx.filter_ttl_secs),
+        )
+        .await?;
+    Ok(node)
 }

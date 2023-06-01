@@ -47,6 +47,7 @@ pub struct Context {
     pub cache: CacheConfig,
     pub metrics_registry: Arc<Registry>,
     pub metrics: Metrics,
+    pub filter_ttl_secs: usize,
 }
 
 impl Context {
@@ -76,6 +77,7 @@ impl Context {
             cache: config.cache,
             metrics_registry: Arc::new(metrics_registry),
             metrics,
+            filter_ttl_secs: config.filter_ttl_secs,
         })
     }
 
