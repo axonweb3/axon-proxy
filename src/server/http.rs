@@ -2,7 +2,10 @@ use axum::{
     body::Bytes,
     body::StreamBody,
     extract::State,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use itertools::{chain, intersperse};
@@ -16,15 +19,19 @@ fn json_response(json_bytes: JsonBytes) -> Response {
     ([(CONTENT_TYPE, APPLICATION_JSON)], json_bytes).into_response()
 }
 
-fn json_arr_response(
-    bytes_iter: impl Iterator<Item = JsonBytes> + Send + Sync + 'static,
-) -> Response {
+fn json_arr_response(results: Vec<Bytes>) -> Response {
+    let len = results.iter().map(|b| b.len()).sum::<usize>() + results.len() + 1;
     (
-        [(CONTENT_TYPE, APPLICATION_JSON)],
+        [
+            (CONTENT_TYPE, APPLICATION_JSON),
+            // Set content length so the response does not use chunked encoding.
+            (CONTENT_LENGTH, &len.to_string()),
+        ],
+        // This will use writev under the hood.
         StreamBody::new(futures::stream::iter(
             chain!(
                 std::iter::once(Bytes::from_static(b"[")),
-                intersperse(bytes_iter, Bytes::from_static(b",")),
+                intersperse(results, Bytes::from_static(b",")),
                 std::iter::once(Bytes::from_static(b"]")),
             )
             .map(anyhow::Ok),
@@ -60,7 +67,7 @@ pub async fn post_handler(
             }
         }
         if !results.is_empty() {
-            json_arr_response(results.into_iter())
+            json_arr_response(results)
         } else {
             // If there are no Response objects contained within the Response
             // array as it is to be sent to the client, the server MUST NOT
