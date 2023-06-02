@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub nodes: Vec<Node>,
+    pub ws_nodes: Vec<String>,
     /// Does not support reloading.
     pub bind: AddrOrPort,
     pub redis: deadpool_redis::Config,
@@ -17,10 +18,20 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default = "default_filter_ttl_secs")]
     pub filter_ttl_secs: usize,
+    #[serde(default)]
+    pub lb: LB,
 }
 
 fn default_filter_ttl_secs() -> usize {
     90
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LB {
+    #[default]
+    P2cLeastRequests,
+    ClientIpHashing,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -34,10 +45,10 @@ pub enum AddrOrPort {
 #[serde(deny_unknown_fields)]
 pub struct Node {
     /// E.g. http://host:80/
-    pub rpc: String,
-    /// E.g. ws://host:80/
-    pub ws: Option<String>,
-    /// Rpc load balancing weight. Default 1.0. Does not affect ws.
+    pub url: String,
+    /// Rpc load balancing weight. Default 1.0.
+    ///
+    /// Has no effect when lb is p2c_least_requests.
     pub weight: Option<f64>,
 }
 

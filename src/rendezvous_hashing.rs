@@ -1,117 +1,95 @@
-use std::{
-    borrow::Borrow,
-    hash::{Hash, Hasher},
-};
+use std::hash::{Hash, Hasher};
 
-pub struct WeightedRendezvousHashing<H, N> {
-    // Vec of (node, weight).
-    nodes: Vec<(N, f64)>,
-    state: H,
+pub fn rendezvous_hashing<N: Hash>(
+    nodes: impl IntoIterator<Item = N>,
+    key: impl Hash,
+    hasher: impl Hasher + Clone,
+) -> Option<usize> {
+    nodes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, n)| {
+            let mut s = hasher.clone();
+            key.hash(&mut s);
+            n.hash(&mut s);
+            let h = s.finish();
+            (h, idx)
+        })
+        .max_by_key(|(h, _)| *h)
+        .map(|(_, idx)| idx)
 }
 
-impl<H, N> WeightedRendezvousHashing<H, N>
-where
-    H: Hasher + Clone,
-    N: Hash,
-{
-    /// Choose a node based on key.
-    ///
-    /// Returns None only if there are no nodes.
-    pub fn choose<K>(&self, key: K) -> Option<&N>
-    where
-        K: Hash,
-    {
-        self.nodes
-            .iter()
-            .map(|(node, weight)| {
-                let mut s = self.state.clone();
-                key.hash(&mut s);
-                node.hash(&mut s);
-                let hash = s.finish();
-                // https://www.snia.org/sites/default/files/SDC15_presentations/dist_sys/Jason_Resch_New_Consistent_Hashings_Rev.pdf
-                //
-                // This is 0 when hash is 0, -inf when hash is u64::MAX.
-                (-weight / (hash as f64 / u64::MAX as f64).ln(), node)
-            })
-            .max_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Less))
-            .map(|wn| wn.1)
-    }
+pub trait NodeWithWeight {
+    type T: Hash;
+    fn tag(&self) -> Self::T;
+    /// Weight must positive and normal.
+    fn weight(&self) -> f64;
+}
 
-    pub fn new(state: H) -> Self {
-        Self {
-            nodes: Vec::new(),
-            state,
-        }
+impl<'a, T: Hash> NodeWithWeight for &'a (T, f64) {
+    type T = &'a T;
+    fn tag(&self) -> Self::T {
+        &self.0
     }
+    fn weight(&self) -> f64 {
+        self.1
+    }
+}
 
-    /// Add a node.
-    ///
-    /// You shouldn't add duplicated nodes.
-    ///
-    /// # Panics
-    ///
-    /// If the weight is not normal and positive.
-    pub fn add(&mut self, node: N, weight: f64) {
-        assert!(weight.is_normal() && weight > 0.);
-        self.nodes.push((node, weight))
-    }
-
-    /// Remove nodes equal to node.
-    pub fn remove<Q>(&mut self, node: &Q)
-    where
-        N: Borrow<Q>,
-        Q: Eq,
-    {
-        self.nodes.retain(|(n, _)| n.borrow() != node);
-    }
+pub fn weighted_rendezvous_hashing<N: NodeWithWeight>(
+    nodes: impl IntoIterator<Item = N>,
+    key: impl Hash,
+    hasher: impl Hasher + Clone,
+) -> Option<usize> {
+    nodes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, n)| {
+            let mut s = hasher.clone();
+            key.hash(&mut s);
+            n.tag().hash(&mut s);
+            let hash = s.finish();
+            // https://www.snia.org/sites/default/files/SDC15_presentations/dist_sys/Jason_Resch_New_Consistent_Hashings_Rev.pdf
+            //
+            // This is 0 when hash is 0, -inf when hash is u64::MAX.
+            (-n.weight() / (hash as f64 / u64::MAX as f64).ln(), idx)
+        })
+        .max_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Less))
+        .map(|(_, idx)| idx)
 }
 
 pub struct RendezvousHashing<H, N> {
-    nodes: Vec<N>,
+    pub nodes: Vec<N>,
     state: H,
 }
 
 impl<H, N> RendezvousHashing<H, N>
 where
     H: Hasher + Clone,
-    N: Hash,
+    N: NodeWithWeight,
 {
     /// Choose a node based on key.
     ///
     /// Returns None only if there are no nodes.
-    pub fn choose<K>(&self, key: K) -> Option<&N>
+    pub fn choose<K>(&self, key: K) -> Option<usize>
     where
         K: Hash,
     {
-        self.nodes.iter().max_by_key(|node| {
-            let mut s = self.state.clone();
-            key.hash(&mut s);
-            node.hash(&mut s);
-            s.finish()
-        })
-    }
-
-    pub fn new(state: H) -> Self {
-        Self {
-            nodes: Vec::new(),
-            state,
-        }
-    }
-
-    /// Add a node.
-    ///
-    /// You shouldn't add duplicated nodes.
-    pub fn add(&mut self, node: N) {
-        self.nodes.push(node)
-    }
-
-    /// Remove nodes equal to node.
-    pub fn remove<Q>(&mut self, node: &Q)
-    where
-        N: Borrow<Q>,
-        Q: Eq,
-    {
-        self.nodes.retain(|n| n.borrow() != node);
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| {
+                let mut s = self.state.clone();
+                key.hash(&mut s);
+                n.tag().hash(&mut s);
+                let hash = s.finish();
+                // https://www.snia.org/sites/default/files/SDC15_presentations/dist_sys/Jason_Resch_New_Consistent_Hashings_Rev.pdf
+                //
+                // This is 0 when hash is 0, -inf when hash is u64::MAX.
+                (-n.weight() / (hash as f64 / u64::MAX as f64).ln(), idx)
+            })
+            .max_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Less))
+            .map(|wn| wn.1)
     }
 }
 
@@ -123,18 +101,12 @@ mod tests {
 
     #[test]
     fn test_distribution() {
-        let mut rh = RendezvousHashing::new(SipHasher::new());
-
-        rh.add(0);
-        rh.add(1);
-        rh.add(2);
-        rh.add(3);
-        rh.add(4);
+        let nodes = [0, 1, 2, 3, 4];
 
         let mut choosen = [0, 0, 0, 0, 0];
 
         for i in 0..10000 {
-            choosen[*rh.choose(i).unwrap() as usize] += 1;
+            choosen[rendezvous_hashing(nodes, i, SipHasher::new()).unwrap()] += 1;
         }
 
         for c in choosen {
@@ -144,17 +116,12 @@ mod tests {
 
     #[test]
     fn test_distribution_weighted() {
-        let mut wrh = WeightedRendezvousHashing::new(SipHasher::new());
-
-        wrh.add(0, 4.);
-        wrh.add(1, 3.);
-        wrh.add(2, 2.);
-        wrh.add(3, 1.);
+        let nodes = [(0, 4.), (1, 3.), (2, 2.), (3, 1.)];
 
         let mut choosen = [0, 0, 0, 0];
 
         for i in 0..10000 {
-            choosen[*wrh.choose(i).unwrap() as usize] += 1;
+            choosen[weighted_rendezvous_hashing(&nodes, i, SipHasher::new()).unwrap()] += 1;
         }
 
         for c in choosen {

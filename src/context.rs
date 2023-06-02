@@ -1,6 +1,9 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{ensure, Result};
@@ -10,34 +13,19 @@ use prometheus_client::{
     metrics::{counter::Counter, histogram::Histogram},
     registry::Registry,
 };
-use rand::{thread_rng, Rng};
 use reqwest::Client;
 use siphasher::sip::SipHasher;
 
 use crate::{
-    config::{AddrOrPort, CacheConfig, Config, RateLimit},
-    rendezvous_hashing::WeightedRendezvousHashing,
+    config::{AddrOrPort, CacheConfig, Config, RateLimit, LB},
+    rendezvous_hashing::{weighted_rendezvous_hashing, NodeWithWeight},
 };
 
 pub type SharedContext = Arc<ArcSwap<Context>>;
 
-#[derive(Clone)]
-pub struct Metrics {
-    pub http_requests: Counter,
-    pub ws_accepted: Counter,
-    pub rpc_requests: Counter,
-    /// Unit: seconds.
-    pub rpc_response_time: Histogram,
-    pub cache_hit: Counter,
-    pub cache_miss: Counter,
-    pub rpc_rate_limited: Counter,
-    pub ws_message_sent: Counter,
-    pub ws_message_received: Counter,
-}
-
 pub struct Context {
     pub bind: SocketAddr,
-    pub rpc_nodes: WeightedRendezvousHashing<SipHasher, String>,
+    pub rpc_nodes: Vec<Node>,
     pub ws_nodes: Vec<String>,
     // Use reqwest/hyper connection pooling for now.
     pub client: Client,
@@ -47,16 +35,23 @@ pub struct Context {
     pub metrics_registry: Arc<Registry>,
     pub metrics: Metrics,
     pub filter_ttl_secs: usize,
+    pub lb: LB,
 }
 
 impl Context {
     pub fn from_config(config: Config) -> Result<Self> {
         ensure!(!config.nodes.is_empty());
         let pool = config.redis.create_pool(Some(Runtime::Tokio1))?;
-        let ws_nodes = config.nodes.iter().flat_map(|n| n.ws.clone()).collect();
-        let mut rpc_nodes = WeightedRendezvousHashing::new(SipHasher::new());
+        let ws_nodes = config.ws_nodes;
+        let mut rpc_nodes = Vec::with_capacity(config.nodes.len());
         for n in config.nodes {
-            rpc_nodes.add(n.rpc, n.weight.unwrap_or(1.));
+            let weight = n.weight.unwrap_or(1.);
+            ensure!(weight.is_normal() && weight > 0.);
+            rpc_nodes.push(Node {
+                outstanding_requests: AtomicUsize::new(0),
+                url: n.url,
+                weight,
+            });
         }
         let bind = match config.bind {
             AddrOrPort::Port(p) => (Ipv4Addr::UNSPECIFIED, p).into(),
@@ -77,6 +72,7 @@ impl Context {
             metrics_registry: Arc::new(metrics_registry),
             metrics,
             filter_ttl_secs: config.filter_ttl_secs,
+            lb: config.lb,
         })
     }
 
@@ -91,17 +87,103 @@ impl Context {
         })
     }
 
-    pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> &str {
-        self.rpc_nodes.choose(ip).unwrap()
+    pub fn get_rpc_node(&self, node: &str) -> Option<ChosenRpcNode<'_>> {
+        let node = self.rpc_nodes.iter().find(|n| n.url == node)?;
+        node.outstanding_requests.fetch_add(1, Ordering::Relaxed);
+        Some(ChosenRpcNode { node })
+    }
+
+    pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> ChosenRpcNode<'_> {
+        let node = match self.lb {
+            LB::P2cLeastRequests => self.choose_rpc_node_p2c_least_requests(),
+            LB::ClientIpHashing => self.choose_rpc_node_by_ip_hashing(ip),
+        };
+        node.outstanding_requests.fetch_add(1, Ordering::Relaxed);
+        ChosenRpcNode { node }
+    }
+
+    fn choose_rpc_node_by_ip_hashing(&self, ip: Ipv4Addr) -> &Node {
+        let idx = weighted_rendezvous_hashing(&self.rpc_nodes, ip, SipHasher::new()).unwrap();
+        &self.rpc_nodes[idx]
+    }
+
+    fn choose_rpc_node_p2c_least_requests(&self) -> &Node {
+        // For a smaller number of nodes, just use least of all.
+        if self.rpc_nodes.len() < 4 {
+            self.rpc_nodes
+                .iter()
+                .min_by_key(|n| n.outstanding_requests.load(Ordering::Relaxed))
+                .unwrap()
+        } else {
+            // P2C least requests.
+            random_choose_two(&self.rpc_nodes)
+                .into_iter()
+                .min_by_key(|n| n.outstanding_requests.load(Ordering::Relaxed))
+                .unwrap()
+        }
     }
 
     pub fn choose_ws_node(&self) -> Option<&str> {
         if !self.ws_nodes.is_empty() {
-            Some(&self.ws_nodes[thread_rng().gen_range(0..self.ws_nodes.len())])
+            Some(&self.ws_nodes[fastrand::usize(0..self.ws_nodes.len())])
         } else {
             None
         }
     }
+}
+
+pub struct Node {
+    url: String,
+    outstanding_requests: AtomicUsize,
+    weight: f64,
+}
+
+impl<'a> NodeWithWeight for &'a Node {
+    type T = &'a str;
+    fn tag(&self) -> Self::T {
+        &self.url
+    }
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+}
+
+impl Node {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+pub struct ChosenRpcNode<'a> {
+    node: &'a Node,
+}
+
+impl ChosenRpcNode<'_> {
+    pub fn url(&self) -> &str {
+        self.node.url()
+    }
+}
+
+impl<'a> Drop for ChosenRpcNode<'a> {
+    fn drop(&mut self) {
+        self.node
+            .outstanding_requests
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct Metrics {
+    pub http_requests: Counter,
+    pub ws_accepted: Counter,
+    pub rpc_requests: Counter,
+    /// Unit: seconds.
+    pub rpc_response_time: Histogram,
+    pub cache_hit: Counter,
+    pub cache_miss: Counter,
+    pub rpc_rate_limited: Counter,
+    pub ws_message_sent: Counter,
+    pub ws_message_received: Counter,
 }
 
 impl Metrics {
@@ -155,4 +237,19 @@ impl Metrics {
             self.ws_message_received.clone(),
         );
     }
+}
+
+/// Floyd's Algorithm: https://fermatslibrary.com/s/a-sample-of-brilliance
+///
+/// # Panics
+///
+/// If x.len() < 2.
+fn random_choose_two<T>(x: &[T]) -> [&T; 2] {
+    let rng = fastrand::Rng::new();
+    let idx0 = rng.usize(0..x.len() - 1);
+    let mut idx1 = rng.usize(0..x.len());
+    if idx1 == idx0 {
+        idx1 = x.len() - 1;
+    }
+    [&x[idx0], &x[idx1]]
 }

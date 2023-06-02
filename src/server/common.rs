@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::time::Instant;
 
 use crate::{
-    context::Context,
+    context::{ChosenRpcNode, Context},
     redis::{
         caching::{get_or_compute_coalesced, request_coalescing::RequestCoalescing},
         rate_limit::{rate_limit, RateLimitError},
@@ -143,38 +143,6 @@ pub async fn handle_single_request(
         };
     }
 
-    // For filter methods, get node from redis.
-    let node: Cow<str> = if req.method == "eth_getFilterChanges"
-        || req.method == "eth_getFilterLogs"
-        || req.method == "eth_uninstallFilter"
-    {
-        let filter_id = match get_filter_id(&req) {
-            Ok(filter_id) => filter_id,
-            Err(e) => {
-                return req
-                    .is_call()
-                    .then(|| error_response(req.id, INVALID_PARAMS_CODE, &e.to_string()))
-            }
-        };
-        match get_node_by_filter_id(ctx, con.as_deref_mut(), &filter_id).await {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                return req.is_call().then(|| {
-                    error_response(req.id, RESOURCE_NOT_FOUND_ERROR_CODE, "filter id not found")
-                });
-            }
-            Err(e) => {
-                log::warn!("failed to get filter id: {e}");
-                return req
-                    .is_call()
-                    .then(|| error_response(req.id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG));
-            }
-        }
-        .into()
-    } else {
-        ctx.choose_rpc_node(ip).into()
-    };
-
     log::info!("{} {}", ip, req.method);
 
     let is_new_filter = req.method == "eth_newFilter"
@@ -213,8 +181,40 @@ pub async fn handle_single_request(
         }
     }
 
+    // For filter methods, get node from redis. Otherwise choose an RPC node
+    // with the configured method.
+    let node = if req.method == "eth_getFilterChanges"
+        || req.method == "eth_getFilterLogs"
+        || req.method == "eth_uninstallFilter"
+    {
+        let filter_id = match get_filter_id(&req) {
+            Ok(filter_id) => filter_id,
+            Err(e) => {
+                return req
+                    .is_call()
+                    .then(|| error_response(req.id, INVALID_PARAMS_CODE, &e.to_string()))
+            }
+        };
+        match get_node_by_filter_id(ctx, con.as_deref_mut(), &filter_id).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                return req.is_call().then(|| {
+                    error_response(req.id, RESOURCE_NOT_FOUND_ERROR_CODE, "filter id not found")
+                });
+            }
+            Err(e) => {
+                log::warn!("failed to get filter id: {e}");
+                return req
+                    .is_call()
+                    .then(|| error_response(req.id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG));
+            }
+        }
+    } else {
+        ctx.choose_rpc_node(ip)
+    };
+
     if req.is_call() {
-        match cache_get_or_compute(ctx, con, &node, &req, req_bytes.clone()).await {
+        match cache_get_or_compute(ctx, con, node.url(), &req, req_bytes.clone()).await {
             Ok(r) => return Some(r),
             Err(e) => {
                 if !e.is::<NotCached>() {
@@ -231,7 +231,7 @@ pub async fn handle_single_request(
     }
 
     // TODO: retry, circuit breaker, other LBs.
-    let result = request(ctx, &node, req_bytes.clone(), is_new_filter).await;
+    let result = request(ctx, node.url(), req_bytes.clone(), is_new_filter).await;
     if req.is_call() {
         Some(match result {
             Ok(v) => v,
@@ -478,19 +478,23 @@ fn get_filter_id(req: &CallOrNotification) -> Result<String> {
     Ok(filter_id)
 }
 
-async fn get_node_by_filter_id(
-    ctx: &Context,
+async fn get_node_by_filter_id<'ctx>(
+    ctx: &'ctx Context,
     con: Option<&mut Connection>,
     filter_id: &str,
-) -> Result<Option<String>> {
-    let node = con
+) -> Result<Option<ChosenRpcNode<'ctx>>> {
+    let node: Option<String> = con
         .context(NO_REDIS_CONNECTION)?
         .get_ex(
             format!("filter:{filter_id}"),
             Expiry::EX(ctx.filter_ttl_secs),
         )
         .await?;
-    Ok(node)
+    Ok(if let Some(n) = node {
+        ctx.get_rpc_node(&n)
+    } else {
+        None
+    })
 }
 
 pub async fn rpc_rate_limit(

@@ -11,17 +11,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 }
 
 fn bench_rh_100(b: &mut Bencher) {
-    let mut hrw = RendezvousHashing::new(SipHasher::new());
-    for i in 0..100 {
-        hrw.add(("node", i));
-    }
-    b.iter(|| hrw.choose(9i32));
+    let nodes = Vec::from_iter((0..100).map(|i| ("node", i)));
+    b.iter(|| rendezvous_hashing(&nodes, 9i32, SipHasher::new()));
 }
 
 fn bench_wrh_100(b: &mut Bencher) {
-    let mut hrw = WeightedRendezvousHashing::new(SipHasher::new());
-    for i in 0..100 {
-        hrw.add(("node", i), 1.);
-    }
-    b.iter(|| hrw.choose(9i32));
+    let nodes = Vec::from_iter((0..100).map(|i| (("node", i), 1.)));
+    b.iter(|| weighted_rendezvous_hashing(&nodes, 9i32, SipHasher::new()));
 }
