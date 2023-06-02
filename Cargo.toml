@@ -14,7 +14,7 @@ name = "rate_limit"
 harness = false
 
 [profile.release]
-lto = true
+lto = "thin"
 
 [dependencies]
 anyhow = "1.0.71"
