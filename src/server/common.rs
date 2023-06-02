@@ -14,7 +14,7 @@ use jsonrpsee_types::{
     ErrorObject, Id, Response, ResponsePayload, TwoPointZero,
 };
 use once_cell::sync::Lazy;
-use redis::{AsyncCommands, Expiry, FromRedisValue, ToRedisArgs};
+use redis::{aio::Connection, AsyncCommands, Expiry, FromRedisValue, ToRedisArgs};
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -25,17 +25,19 @@ use crate::{
     context::Context,
     redis::{
         caching::{get_or_compute_coalesced, request_coalescing::RequestCoalescing},
-        rate_limit::RateLimitError,
+        rate_limit::{rate_limit, RateLimitError},
     },
 };
 
 use super::ws::LazySocket;
 
-pub const RATE_LIMIT_ERROR_CODE: i32 = -37001;
-pub const SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE: i32 = -37002;
-pub const FILTER_ID_NOT_FOUND_ERROR_CODE: i32 = -37003;
+// https://github.com/MetaMask/eth-rpc-errors/blob/main/src/error-constants.ts
+pub const RESOURCE_NOT_FOUND_ERROR_CODE: i32 = -32001;
+pub const METHOD_NOT_SUPPORTED_ERROR_CODE: i32 = -32004;
+pub const LIMIT_EXCEEDED_ERROR_CODE: i32 = -32005;
 
 pub const APPLICATION_JSON: &str = "application/json";
+static NO_REDIS_CONNECTION: &str = "no redis connection";
 
 // Just Bytes but should have JSON content.
 pub type JsonBytes = Bytes;
@@ -99,6 +101,9 @@ pub enum OnSubscription<'a> {
 /// Result is valid UTF-8.
 pub async fn handle_single_request(
     ctx: &Context,
+    // Take connection so the same connection can be reused. Getting a
+    // connection from the pool is quite expensive.
+    mut con: Option<&mut Connection>,
     ip: IpAddr,
     req_bytes: Bytes,
     on_subscription: OnSubscription<'_>,
@@ -120,12 +125,12 @@ pub async fn handle_single_request(
         IpAddr::V6(_ip) => Ipv4Addr::UNSPECIFIED,
     };
 
-    if let Err(err) = ctx.rate_limit(ip, &req.method).await {
+    if let Err(err) = rpc_rate_limit(ctx, con.as_deref_mut(), ip, &req.method).await {
         return if req.is_call() {
             let (code, msg) = match err.downcast_ref::<RateLimitError>() {
                 Some(err) => {
                     ctx.metrics.rpc_rate_limited.inc();
-                    (RATE_LIMIT_ERROR_CODE, err.to_string())
+                    (LIMIT_EXCEEDED_ERROR_CODE, err.to_string())
                 }
                 None => {
                     log::warn!("rate limit error: {err}");
@@ -151,15 +156,11 @@ pub async fn handle_single_request(
                     .then(|| error_response(req.id, INVALID_PARAMS_CODE, &e.to_string()))
             }
         };
-        match get_node_by_filter_id(ctx, &filter_id).await {
+        match get_node_by_filter_id(ctx, con.as_deref_mut(), &filter_id).await {
             Ok(Some(n)) => n,
             Ok(None) => {
                 return req.is_call().then(|| {
-                    error_response(
-                        req.id,
-                        FILTER_ID_NOT_FOUND_ERROR_CODE,
-                        "filter id not found",
-                    )
+                    error_response(req.id, RESOURCE_NOT_FOUND_ERROR_CODE, "filter id not found")
                 });
             }
             Err(e) => {
@@ -185,14 +186,14 @@ pub async fn handle_single_request(
             OnSubscription::ErrorWsBatch => {
                 return Some(error_response(
                     req.id,
-                    SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                    METHOD_NOT_SUPPORTED_ERROR_CODE,
                     "subscription in batch request is not supported",
                 ));
             }
             OnSubscription::ErrorHttp => {
                 return Some(error_response(
                     req.id,
-                    SUBSCRIPTION_NOT_SUPPORTED_ERROR_CODE,
+                    METHOD_NOT_SUPPORTED_ERROR_CODE,
                     "subscription over http is not supported",
                 ));
             }
@@ -213,7 +214,7 @@ pub async fn handle_single_request(
     }
 
     if req.is_call() {
-        match cache_get_or_compute(ctx, &node, &req, req_bytes.clone()).await {
+        match cache_get_or_compute(ctx, con, &node, &req, req_bytes.clone()).await {
             Ok(r) => return Some(r),
             Err(e) => {
                 if !e.is::<NotCached>() {
@@ -382,12 +383,15 @@ struct NotCached;
 
 pub async fn cache_get_or_compute(
     ctx: &Context,
+    con: Option<&mut Connection>,
     node: &str,
     req: &CallOrNotification<'_>,
     req_bytes: JsonBytes,
 ) -> Result<JsonBytes> {
     static COALESCING: Lazy<RequestCoalescing<CacheKey, Result<CacheValue, JsonBytes>>> =
         Lazy::new(RequestCoalescing::default);
+
+    let con = con.context(NO_REDIS_CONNECTION)?;
 
     let cache_key = if ctx.cache.eth_call && req.method == "eth_call"
         || ctx.cache.eth_estimate_gas && req.method == "eth_estimateGas"
@@ -411,7 +415,7 @@ pub async fn cache_get_or_compute(
     };
     let mut computed = false;
     let r = get_or_compute_coalesced(
-        &ctx.pool,
+        con,
         &COALESCING,
         cache_key,
         ctx.cache.expire_milliseconds,
@@ -474,15 +478,52 @@ fn get_filter_id(req: &CallOrNotification) -> Result<String> {
     Ok(filter_id)
 }
 
-async fn get_node_by_filter_id(ctx: &Context, filter_id: &str) -> Result<Option<String>> {
-    let node = ctx
-        .pool
-        .get()
-        .await?
+async fn get_node_by_filter_id(
+    ctx: &Context,
+    con: Option<&mut Connection>,
+    filter_id: &str,
+) -> Result<Option<String>> {
+    let node = con
+        .context(NO_REDIS_CONNECTION)?
         .get_ex(
             format!("filter:{filter_id}"),
             Expiry::EX(ctx.filter_ttl_secs),
         )
         .await?;
     Ok(node)
+}
+
+pub async fn rpc_rate_limit(
+    ctx: &Context,
+    con: Option<&mut Connection>,
+    ip: Ipv4Addr,
+    method: &str,
+) -> Result<()> {
+    let con = con.context(NO_REDIS_CONNECTION)?;
+    if let Some(ref rl) = ctx.rate_limiting {
+        let rl = rl.ip.get(&ip).map(|r| &**r).unwrap_or(rl);
+
+        let total_limit = rl.total;
+
+        rate_limit(
+            con,
+            format!("rate_limit:{ip}"),
+            1,
+            60000,
+            total_limit.into(),
+        )
+        .await?;
+
+        if let Some(method_limit) = rl.method.get(method).cloned() {
+            rate_limit(
+                con,
+                format!("rate_limit:{ip}:{method}"),
+                1,
+                60000,
+                method_limit.into(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }

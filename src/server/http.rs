@@ -47,6 +47,9 @@ pub async fn post_handler(
 ) -> Response {
     let ctx = ctx.load();
     ctx.metrics.http_requests.inc();
+
+    let mut con = ctx.pool.get().await.ok();
+
     if let Ok(reqs) = serde_json::from_slice::<Vec<&RawValue>>(&body[..]) {
         if reqs.is_empty() {
             // Empty batch is invalid.
@@ -60,8 +63,14 @@ pub async fn post_handler(
         for raw_req in &reqs {
             // Zero copy subslicing!
             let req_bytes = body.slice_ref(raw_req.get().as_bytes());
-            if let Some(res) =
-                handle_single_request(&ctx, ip, req_bytes, OnSubscription::ErrorHttp).await
+            if let Some(res) = handle_single_request(
+                &ctx,
+                con.as_deref_mut(),
+                ip,
+                req_bytes,
+                OnSubscription::ErrorHttp,
+            )
+            .await
             {
                 results.push(res);
             }
@@ -75,7 +84,14 @@ pub async fn post_handler(
             StatusCode::NO_CONTENT.into_response()
         }
     } else {
-        let result = handle_single_request(&ctx, ip, body, OnSubscription::ErrorHttp).await;
+        let result = handle_single_request(
+            &ctx,
+            con.as_deref_mut(),
+            ip,
+            body,
+            OnSubscription::ErrorHttp,
+        )
+        .await;
         if let Some(result) = result {
             json_response(result)
         } else {

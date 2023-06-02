@@ -16,7 +16,6 @@ use siphasher::sip::SipHasher;
 
 use crate::{
     config::{AddrOrPort, CacheConfig, Config, RateLimit},
-    redis::rate_limit::rate_limit,
     rendezvous_hashing::WeightedRendezvousHashing,
 };
 
@@ -90,36 +89,6 @@ impl Context {
             metrics: previous.metrics.clone(),
             ..new
         })
-    }
-
-    pub async fn rate_limit(&self, ip: Ipv4Addr, method: &str) -> Result<()> {
-        if let Some(ref rl) = self.rate_limiting {
-            let rl = rl.ip.get(&ip).map(|r| &**r).unwrap_or(rl);
-
-            let total_limit = rl.total;
-
-            let mut con = self.pool.get().await?;
-            rate_limit(
-                &mut con,
-                format!("rate_limit:{ip}"),
-                1,
-                60000,
-                total_limit.into(),
-            )
-            .await?;
-
-            if let Some(method_limit) = rl.method.get(method).cloned() {
-                rate_limit(
-                    &mut con,
-                    format!("rate_limit:{ip}:{method}"),
-                    1,
-                    60000,
-                    method_limit.into(),
-                )
-                .await?;
-            }
-        }
-        Ok(())
     }
 
     pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> &str {

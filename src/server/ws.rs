@@ -154,6 +154,7 @@ async fn handle_ws_msg(
     msg: String,
 ) -> Option<JsonBytes> {
     let msg: Bytes = msg.into();
+    let mut con = ctx.pool.get().await.ok();
     if let Ok(reqs) = serde_json::from_slice::<Vec<&RawValue>>(&msg) {
         if reqs.is_empty() {
             return Some(error_response(
@@ -165,8 +166,14 @@ async fn handle_ws_msg(
         let mut results = Vec::with_capacity(reqs.len());
         for raw_req in &reqs {
             let req_bytes = raw_req.get().to_string().into();
-            if let Some(res) =
-                handle_single_request(ctx, ip, req_bytes, OnSubscription::ErrorWsBatch).await
+            if let Some(res) = handle_single_request(
+                ctx,
+                con.as_deref_mut(),
+                ip,
+                req_bytes,
+                OnSubscription::ErrorWsBatch,
+            )
+            .await
             {
                 results.push(res);
             }
@@ -183,6 +190,13 @@ async fn handle_ws_msg(
             None
         }
     } else {
-        handle_single_request(ctx, ip, msg, OnSubscription::ForwardWs(upstream)).await
+        handle_single_request(
+            ctx,
+            con.as_deref_mut(),
+            ip,
+            msg,
+            OnSubscription::ForwardWs(upstream),
+        )
+        .await
     }
 }
