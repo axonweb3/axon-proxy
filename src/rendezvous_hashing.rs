@@ -40,11 +40,10 @@ pub fn weighted_rendezvous_hashing<N: NodeWithWeight>(
     nodes: impl IntoIterator<Item = N>,
     key: impl Hash,
     hasher: impl Hasher + Clone,
-) -> Option<usize> {
+) -> Option<N> {
     nodes
         .into_iter()
-        .enumerate()
-        .map(|(idx, n)| {
+        .map(|n| {
             let mut s = hasher.clone();
             key.hash(&mut s);
             n.tag().hash(&mut s);
@@ -52,45 +51,10 @@ pub fn weighted_rendezvous_hashing<N: NodeWithWeight>(
             // https://www.snia.org/sites/default/files/SDC15_presentations/dist_sys/Jason_Resch_New_Consistent_Hashings_Rev.pdf
             //
             // This is 0 when hash is 0, -inf when hash is u64::MAX.
-            (-n.weight() / (hash as f64 / u64::MAX as f64).ln(), idx)
+            (-n.weight() / (hash as f64 / u64::MAX as f64).ln(), n)
         })
         .max_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Less))
-        .map(|(_, idx)| idx)
-}
-
-pub struct RendezvousHashing<H, N> {
-    pub nodes: Vec<N>,
-    state: H,
-}
-
-impl<H, N> RendezvousHashing<H, N>
-where
-    H: Hasher + Clone,
-    N: NodeWithWeight,
-{
-    /// Choose a node based on key.
-    ///
-    /// Returns None only if there are no nodes.
-    pub fn choose<K>(&self, key: K) -> Option<usize>
-    where
-        K: Hash,
-    {
-        self.nodes
-            .iter()
-            .enumerate()
-            .map(|(idx, n)| {
-                let mut s = self.state.clone();
-                key.hash(&mut s);
-                n.tag().hash(&mut s);
-                let hash = s.finish();
-                // https://www.snia.org/sites/default/files/SDC15_presentations/dist_sys/Jason_Resch_New_Consistent_Hashings_Rev.pdf
-                //
-                // This is 0 when hash is 0, -inf when hash is u64::MAX.
-                (-n.weight() / (hash as f64 / u64::MAX as f64).ln(), idx)
-            })
-            .max_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap_or(std::cmp::Ordering::Less))
-            .map(|wn| wn.1)
-    }
+        .map(|(_, n)| n)
 }
 
 #[cfg(test)]
@@ -121,7 +85,9 @@ mod tests {
         let mut choosen = [0, 0, 0, 0];
 
         for i in 0..10000 {
-            choosen[weighted_rendezvous_hashing(&nodes, i, SipHasher::new()).unwrap()] += 1;
+            choosen[weighted_rendezvous_hashing(&nodes, i, SipHasher::new())
+                .unwrap()
+                .0 as usize] += 1;
         }
 
         for c in choosen {

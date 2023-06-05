@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::time::Instant;
 
 use crate::{
-    context::{ChosenRpcNode, Context},
+    context::{Context, Node},
     redis::{
         caching::{get_or_compute_coalesced, request_coalescing::RequestCoalescing},
         rate_limit::{rate_limit, RateLimitError},
@@ -183,7 +183,7 @@ pub async fn handle_single_request(
 
     // For filter methods, get node from redis. Otherwise choose an RPC node
     // with the configured method.
-    let node = if req.method == "eth_getFilterChanges"
+    let (node, is_sticky) = if req.method == "eth_getFilterChanges"
         || req.method == "eth_getFilterLogs"
         || req.method == "eth_uninstallFilter"
     {
@@ -196,7 +196,7 @@ pub async fn handle_single_request(
             }
         };
         match get_node_by_filter_id(ctx, con.as_deref_mut(), &filter_id).await {
-            Ok(Some(n)) => n,
+            Ok(Some(n)) => (n, true),
             Ok(None) => {
                 return req.is_call().then(|| {
                     error_response(req.id, RESOURCE_NOT_FOUND_ERROR_CODE, "filter id not found")
@@ -210,11 +210,11 @@ pub async fn handle_single_request(
             }
         }
     } else {
-        ctx.choose_rpc_node(ip)
+        (ctx.choose_rpc_node(ip), false)
     };
 
     if req.is_call() {
-        match cache_get_or_compute(ctx, con, node.url(), &req, req_bytes.clone()).await {
+        match cache_get_or_compute(ctx, con, node, &req, req_bytes.clone()).await {
             Ok(r) => return Some(r),
             Err(e) => {
                 if !e.is::<NotCached>() {
@@ -230,8 +230,8 @@ pub async fn handle_single_request(
         return None;
     }
 
-    // TODO: retry, circuit breaker, other LBs.
-    let result = request(ctx, node.url(), req_bytes.clone(), is_new_filter).await;
+    // TODO: timeout?
+    let result = request(ctx, node, req_bytes.clone(), is_new_filter, !is_sticky).await;
     if req.is_call() {
         Some(match result {
             Ok(v) => v,
@@ -247,23 +247,50 @@ pub async fn handle_single_request(
 
 /// Full jsonrpc request -> response.
 ///
-/// If the request creates a new filter, the filter id -> node mapping is saved in redis.
+/// # Params
+///
+/// * `is_new_filter`: should be true for requests that creates a new filter,
+/// the filter id -> node mapping is saved in redis.
+///
+/// * `retry_second`: if true, retry requesting a second node if node cannot be
+/// connected.
 pub async fn request(
     ctx: &Context,
-    node: &str,
+    mut node: &Node,
     req: JsonBytes,
     is_new_filter: bool,
+    mut retry_second: bool,
 ) -> Result<JsonBytes> {
-    let response = ctx
-        .client
-        .post(node)
-        .header(CONTENT_TYPE, APPLICATION_JSON)
-        .body(req)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let response = loop {
+        let _in_use = if ctx.is_least_requests_lb() {
+            Some(node.in_use())
+        } else {
+            None
+        };
+        let result = ctx
+            .client
+            .post(node.url())
+            .header(CONTENT_TYPE, APPLICATION_JSON)
+            .body(req.clone())
+            .send()
+            .await;
+        match result {
+            Ok(r) => break r.error_for_status()?.bytes().await?,
+            // It's safe to retry on timeout error because we are only using
+            // connect timeout.
+            Err(e) if retry_second && (e.is_connect() || e.is_timeout()) => {
+                node.set_unhealthy();
+                if let Some(second) = ctx.choose_second_node(node) {
+                    node = second;
+                    retry_second = false;
+                } else {
+                    bail!(e);
+                }
+            }
+            Err(e) => bail!(e),
+        }
+    };
+
     if response.is_empty() {
         return Ok(response);
     }
@@ -274,7 +301,11 @@ pub async fn request(
             ctx.pool
                 .get()
                 .await?
-                .set_ex(format!("filter:{filter_id}"), node, ctx.filter_ttl_secs)
+                .set_ex(
+                    format!("filter:{filter_id}"),
+                    node.url(),
+                    ctx.filter_ttl_secs,
+                )
                 .await?;
         }
         Ok(response)
@@ -384,7 +415,7 @@ struct NotCached;
 pub async fn cache_get_or_compute(
     ctx: &Context,
     con: Option<&mut Connection>,
-    node: &str,
+    node: &Node,
     req: &CallOrNotification<'_>,
     req_bytes: JsonBytes,
 ) -> Result<JsonBytes> {
@@ -421,7 +452,7 @@ pub async fn cache_get_or_compute(
         ctx.cache.expire_milliseconds,
         async {
             computed = true;
-            request(ctx, node, req_bytes, false)
+            request(ctx, node, req_bytes, false, true)
                 .await
                 .map(CacheValue)
                 .map_err(|e| {
@@ -448,10 +479,15 @@ pub async fn cache_get_or_compute(
     Ok(r.to_string().into())
 }
 
-pub async fn get_tip_block_hash(ctx: &Context, node: &str) -> Result<String> {
+pub async fn get_tip_block_hash(ctx: &Context, node: &Node) -> Result<String> {
+    let _in_use = if ctx.is_least_requests_lb() {
+        Some(node.in_use())
+    } else {
+        None
+    };
     let result = ctx
         .client
-        .post(node)
+        .post(node.url())
         .header(CONTENT_TYPE, APPLICATION_JSON)
         .body(
             r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","id":1,"params":["latest",false]}"#,
@@ -482,7 +518,7 @@ async fn get_node_by_filter_id<'ctx>(
     ctx: &'ctx Context,
     con: Option<&mut Connection>,
     filter_id: &str,
-) -> Result<Option<ChosenRpcNode<'ctx>>> {
+) -> Result<Option<&'ctx Node>> {
     let node: Option<String> = con
         .context(NO_REDIS_CONNECTION)?
         .get_ex(

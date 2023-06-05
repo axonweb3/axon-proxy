@@ -28,29 +28,15 @@ async fn reload(context: &SharedContext, path: &Path) -> Result<()> {
         .await
         .context("reading config file")?;
     let config = toml::from_str(&config).context("parsing config file")?;
-    let new_context = Context::from_config_and_previous(config, &context.load())?;
-    context.store(Arc::new(new_context));
+    context.store(Context::from_config_and_previous(config, &context.load())?);
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let args = ProxyArgs::parse();
-    env_logger::init();
-
-    let config_path = args.config;
-    let config = std::fs::read_to_string(&config_path).context("reading config file")?;
-    let config: Config = toml::from_str(&config).context("parsing config file")?;
-    let context = Arc::new(ArcSwap::from_pointee(Context::from_config(config)?));
-
-    let p: usize = std::thread::available_parallelism()?.into();
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads.unwrap_or(p))
-        .enable_all()
-        .build()?;
+async fn real_main(config: Config, config_path: PathBuf) -> Result<()> {
+    let context = Arc::new(ArcSwap::new(Context::from_config(config)?));
 
     let context1 = context.clone();
-    rt.spawn(async move {
+    tokio::spawn(async move {
         let mut hup = tokio::signal::unix::signal(SignalKind::hangup()).unwrap();
         loop {
             hup.recv().await.unwrap();
@@ -61,7 +47,25 @@ fn main() -> Result<()> {
         }
     });
 
-    rt.block_on(my_proxy::server::serve(context))?;
+    my_proxy::server::serve(context).await?;
 
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = ProxyArgs::parse();
+    env_logger::init();
+
+    let config_path = args.config;
+    let config = std::fs::read_to_string(&config_path).context("reading config file")?;
+    let config: Config = toml::from_str(&config).context("parsing config file")?;
+
+    let p: usize = std::thread::available_parallelism()?.into();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads.unwrap_or(p))
+        .enable_all()
+        .build()?;
+
+    rt.block_on(real_main(config, config_path))
 }

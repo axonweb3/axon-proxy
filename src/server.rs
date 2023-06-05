@@ -1,5 +1,5 @@
 mod client_ip;
-mod common;
+pub mod common;
 mod http;
 mod ws;
 

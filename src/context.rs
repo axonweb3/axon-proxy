@@ -1,14 +1,16 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Weak,
     },
+    time::Duration,
 };
 
 use anyhow::{ensure, Result};
 use arc_swap::ArcSwap;
 use deadpool_redis::{Pool, Runtime};
+use futures::StreamExt;
 use prometheus_client::{
     metrics::{counter::Counter, histogram::Histogram},
     registry::Registry,
@@ -17,8 +19,9 @@ use reqwest::Client;
 use siphasher::sip::SipHasher;
 
 use crate::{
-    config::{AddrOrPort, CacheConfig, Config, RateLimit, LB},
+    config::{AddrOrPort, CacheConfig, Config, HealthCheckConfig, RateLimit, LB},
     rendezvous_hashing::{weighted_rendezvous_hashing, NodeWithWeight},
+    server::common::get_tip_block_hash,
 };
 
 pub type SharedContext = Arc<ArcSwap<Context>>;
@@ -36,10 +39,36 @@ pub struct Context {
     pub metrics: Metrics,
     pub filter_ttl_secs: usize,
     pub lb: LB,
+    pub health_check: HealthCheckConfig,
 }
 
 impl Context {
-    pub fn from_config(config: Config) -> Result<Self> {
+    pub fn from_config(config: Config) -> Result<Arc<Self>> {
+        let ctx = Arc::new(Self::from_config_inner(config)?);
+
+        if ctx.health_check.enabled {
+            tokio::spawn(health_check(Arc::downgrade(&ctx)));
+        }
+
+        Ok(ctx)
+    }
+
+    /// Create a new context, reusing previous client and metrics.
+    pub fn from_config_and_previous(config: Config, previous: &Self) -> Result<Arc<Self>> {
+        let new = Self::from_config_inner(config)?;
+        let ctx = Arc::new(Self {
+            client: previous.client.clone(),
+            metrics_registry: previous.metrics_registry.clone(),
+            metrics: previous.metrics.clone(),
+            ..new
+        });
+        if ctx.health_check.enabled {
+            tokio::spawn(health_check(Arc::downgrade(&ctx)));
+        }
+        Ok(ctx)
+    }
+
+    fn from_config_inner(config: Config) -> Result<Self> {
         ensure!(!config.nodes.is_empty());
         let pool = config.redis.create_pool(Some(Runtime::Tokio1))?;
         let ws_nodes = config.ws_nodes;
@@ -47,9 +76,13 @@ impl Context {
         for n in config.nodes {
             let weight = n.weight.unwrap_or(1.);
             ensure!(weight.is_normal() && weight > 0.);
+            if matches!(config.lb, LB::P2cLeastRequests) && weight != 1. {
+                log::warn!("Node weight has no effect when lb is p2c_least_requests");
+            }
             rpc_nodes.push(Node {
                 outstanding_requests: AtomicUsize::new(0),
                 url: n.url,
+                healthy: AtomicBool::new(true),
                 weight,
             });
         }
@@ -57,10 +90,16 @@ impl Context {
             AddrOrPort::Port(p) => (Ipv4Addr::UNSPECIFIED, p).into(),
             AddrOrPort::Addr(a) => a,
         };
-        let client = Client::builder().pool_max_idle_per_host(100).build()?;
+        // Note: don't add whole request timeout unless you understand how
+        // that'll affect the retry mechanism.
+        let client = Client::builder()
+            .pool_max_idle_per_host(100)
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs.into()))
+            .build()?;
         let mut metrics_registry = Registry::default();
         let metrics = Metrics::new();
         metrics.register(&mut metrics_registry);
+
         Ok(Self {
             bind,
             rpc_nodes,
@@ -73,53 +112,69 @@ impl Context {
             metrics,
             filter_ttl_secs: config.filter_ttl_secs,
             lb: config.lb,
+            health_check: config.health_check,
         })
     }
 
-    /// Create a new context, reusing previous client and metrics.
-    pub fn from_config_and_previous(config: Config, previous: &Self) -> Result<Self> {
-        let new = Self::from_config(config)?;
-        Ok(Self {
-            client: previous.client.clone(),
-            metrics_registry: previous.metrics_registry.clone(),
-            metrics: previous.metrics.clone(),
-            ..new
-        })
-    }
-
-    pub fn get_rpc_node(&self, node: &str) -> Option<ChosenRpcNode<'_>> {
+    pub fn get_rpc_node(&self, node: &str) -> Option<&Node> {
         let node = self.rpc_nodes.iter().find(|n| n.url == node)?;
         node.outstanding_requests.fetch_add(1, Ordering::Relaxed);
-        Some(ChosenRpcNode { node })
+        Some(node)
     }
 
-    pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> ChosenRpcNode<'_> {
-        let node = match self.lb {
+    pub fn is_least_requests_lb(&self) -> bool {
+        matches!(self.lb, LB::P2cLeastRequests)
+    }
+
+    pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> &Node {
+        match self.lb {
             LB::P2cLeastRequests => self.choose_rpc_node_p2c_least_requests(),
             LB::ClientIpHashing => self.choose_rpc_node_by_ip_hashing(ip),
-        };
-        node.outstanding_requests.fetch_add(1, Ordering::Relaxed);
-        ChosenRpcNode { node }
+        }
     }
 
     fn choose_rpc_node_by_ip_hashing(&self, ip: Ipv4Addr) -> &Node {
-        let idx = weighted_rendezvous_hashing(&self.rpc_nodes, ip, SipHasher::new()).unwrap();
-        &self.rpc_nodes[idx]
+        // Unhealthy nodes are very unlikely to be chosen if there are healthy
+        // nodes because their weight is very low.
+        weighted_rendezvous_hashing(&self.rpc_nodes, ip, SipHasher::new()).unwrap()
     }
 
     fn choose_rpc_node_p2c_least_requests(&self) -> &Node {
-        // For a smaller number of nodes, just use least of all.
-        if self.rpc_nodes.len() < 4 {
-            self.rpc_nodes
-                .iter()
-                .min_by_key(|n| n.outstanding_requests.load(Ordering::Relaxed))
-                .unwrap()
+        let healthy: Vec<&Node> = self
+            .rpc_nodes
+            .iter()
+            .filter(|n| n.healthy.load(Ordering::Relaxed))
+            .collect();
+        let two: [&Node; 2] = match healthy.len() {
+            0 => {
+                // No healthy nodes, pick from unhealthy.
+                let [idx0, idx1] = random_two_indexes(self.rpc_nodes.len());
+                [&self.rpc_nodes[idx0], &self.rpc_nodes[idx1]]
+            }
+            1 => return healthy[0],
+            2 => healthy[..].try_into().unwrap(),
+            l => {
+                let [idx0, idx1] = random_two_indexes(l);
+                [healthy[idx0], healthy[idx1]]
+            }
+        };
+        two.into_iter()
+            .min_by_key(|n| n.outstanding_requests.load(Ordering::Relaxed))
+            .unwrap()
+    }
+
+    /// Randomly choose an RPC node that is different from the first.
+    pub fn choose_second_node(&self, first: &Node) -> Option<&Node> {
+        let healthy: Vec<&Node> = self
+            .rpc_nodes
+            .iter()
+            // Pointer comparison is enough because first is expected to be one of self.rpc_nodes too.
+            .filter(|n| std::ptr::eq(*n, first) && n.healthy.load(Ordering::Relaxed))
+            .collect();
+        if !healthy.is_empty() {
+            Some(healthy[fastrand::usize(0..healthy.len())])
         } else {
-            // P2C least requests.
-            random_choose_two(&self.rpc_nodes)
-                .into_iter()
-                .min_by_key(|n| n.outstanding_requests.load(Ordering::Relaxed))
-                .unwrap()
+            None
         }
     }
 
@@ -135,6 +190,7 @@ impl Context {
 pub struct Node {
     url: String,
     outstanding_requests: AtomicUsize,
+    healthy: AtomicBool,
     weight: f64,
 }
 
@@ -144,7 +200,11 @@ impl<'a> NodeWithWeight for &'a Node {
         &self.url
     }
     fn weight(&self) -> f64 {
-        self.weight
+        if self.healthy.load(Ordering::Relaxed) {
+            self.weight
+        } else {
+            self.weight / 100000.
+        }
     }
 }
 
@@ -152,23 +212,16 @@ impl Node {
     pub fn url(&self) -> &str {
         &self.url
     }
-}
 
-pub struct ChosenRpcNode<'a> {
-    node: &'a Node,
-}
-
-impl ChosenRpcNode<'_> {
-    pub fn url(&self) -> &str {
-        self.node.url()
+    pub fn set_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Relaxed);
     }
-}
 
-impl<'a> Drop for ChosenRpcNode<'a> {
-    fn drop(&mut self) {
-        self.node
-            .outstanding_requests
-            .fetch_sub(1, Ordering::Relaxed);
+    pub fn in_use(&self) -> impl Drop + '_ {
+        self.outstanding_requests.fetch_add(1, Ordering::Relaxed);
+        scopeguard::guard(self, |n| {
+            n.outstanding_requests.fetch_sub(1, Ordering::Relaxed);
+        })
     }
 }
 
@@ -243,13 +296,30 @@ impl Metrics {
 ///
 /// # Panics
 ///
-/// If x.len() < 2.
-fn random_choose_two<T>(x: &[T]) -> [&T; 2] {
+/// If len < 2.
+fn random_two_indexes(len: usize) -> [usize; 2] {
     let rng = fastrand::Rng::new();
-    let idx0 = rng.usize(0..x.len() - 1);
-    let mut idx1 = rng.usize(0..x.len());
+    let idx0 = rng.usize(0..len - 1);
+    let mut idx1 = rng.usize(0..len);
     if idx1 == idx0 {
-        idx1 = x.len() - 1;
+        idx1 = len - 1;
     }
-    [&x[idx0], &x[idx1]]
+    [idx0, idx1]
+}
+
+async fn health_check(ctx: Weak<Context>) {
+    while let Some(ctx) = ctx.upgrade() {
+        futures::stream::iter(&ctx.rpc_nodes)
+            .for_each_concurrent(ctx.health_check.concurrency as usize, |n| async {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(ctx.health_check.timeout_secs.into()),
+                    get_tip_block_hash(&ctx, n),
+                )
+                .await;
+                let healthy = matches!(result, Ok(Ok(_)));
+                n.healthy.store(healthy, Ordering::Relaxed);
+            })
+            .await;
+        tokio::time::sleep(Duration::from_secs(ctx.health_check.interval_secs.into())).await;
+    }
 }
