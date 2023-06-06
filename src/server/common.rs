@@ -279,7 +279,9 @@ pub async fn request(
             // It's safe to retry on timeout error because we are only using
             // connect timeout.
             Err(e) if retry_second && (e.is_connect() || e.is_timeout()) => {
-                node.set_unhealthy();
+                if ctx.health_check.enabled {
+                    node.set_unhealthy();
+                }
                 if let Some(second) = ctx.choose_second_node(node) {
                     node = second;
                     retry_second = false;
