@@ -433,6 +433,9 @@ pub async fn cache_get_or_compute(
             Err(e) => return Ok(error_response(&req.id, INVALID_PARAMS_CODE, &e.to_string())),
         };
         let tip = get_tip_block_hash(ctx, node).await?;
+        // TODO: what if the tip changes between getting tip block and eth_call?
+        // We should probably replace params.1 with actual block hash to
+        // mitigate this race condition.
         let params_json = serde_json::value::to_raw_value(&params)?;
         // Use blake3(tip_block_hash || method || params) as cache key.
         let cache_key = Hasher::new()
