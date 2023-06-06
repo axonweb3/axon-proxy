@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use deadpool_redis::{Pool, Runtime};
 use futures::StreamExt;
 use prometheus_client::{
-    metrics::{counter::Counter, histogram::Histogram},
+    metrics::{counter::Counter, family::Family, gauge::Gauge, histogram::Histogram},
     registry::Registry,
 };
 use reqwest::Client;
@@ -35,7 +35,6 @@ pub struct Context {
     pub pool: Pool,
     pub rate_limiting: Option<RateLimit>,
     pub cache: CacheConfig,
-    pub metrics_registry: Arc<Registry>,
     pub metrics: Metrics,
     pub filter_ttl_secs: usize,
     pub lb: LB,
@@ -58,7 +57,6 @@ impl Context {
         let new = Self::from_config_inner(config)?;
         let ctx = Arc::new(Self {
             client: previous.client.clone(),
-            metrics_registry: previous.metrics_registry.clone(),
             metrics: previous.metrics.clone(),
             ..new
         });
@@ -81,6 +79,7 @@ impl Context {
             }
             rpc_nodes.push(Node {
                 outstanding_requests: AtomicUsize::new(0),
+                requests: AtomicUsize::new(0),
                 url: n.url,
                 healthy: AtomicBool::new(true),
                 weight,
@@ -96,10 +95,7 @@ impl Context {
             .pool_max_idle_per_host(100)
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs.into()))
             .build()?;
-        let mut metrics_registry = Registry::default();
         let metrics = Metrics::new();
-        metrics.register(&mut metrics_registry);
-
         Ok(Self {
             bind,
             rpc_nodes,
@@ -108,7 +104,6 @@ impl Context {
             pool,
             rate_limiting: config.rate_limit,
             cache: config.cache,
-            metrics_registry: Arc::new(metrics_registry),
             metrics,
             filter_ttl_secs: config.filter_ttl_secs,
             lb: config.lb,
@@ -188,11 +183,43 @@ impl Context {
             None
         }
     }
+
+    // Using the registry this way is a bit unconventional. We just want to
+    // encode the atomics, but using the collector API has some lifetime issues,
+    // so we create a new registry on scraping.
+    pub fn register_self_metrics(&self, reg: &mut Registry) {
+        let rpc_requests_per_node = Family::<Vec<(&'static str, String)>, Gauge>::default();
+        let healthy = Family::<Vec<(&'static str, String)>, Gauge>::default();
+        let requests_per_node = Family::<Vec<(&'static str, String)>, Counter>::default();
+        for n in &self.rpc_nodes {
+            rpc_requests_per_node
+                .get_or_create(&vec![("node", n.url.clone())])
+                .set(n.outstanding_requests.load(Ordering::Relaxed) as i64);
+            healthy.get_or_create(&vec![("node", n.url.clone())]).set(
+                if n.healthy.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+            );
+            requests_per_node
+                .get_or_create(&vec![("node", n.url.clone())])
+                .inc_by(n.requests.load(Ordering::Relaxed) as u64);
+        }
+        reg.register(
+            "outstanding_requests",
+            "Outstanding requests per node",
+            rpc_requests_per_node,
+        );
+        reg.register("healthy", "Node healthy", healthy);
+        reg.register("requests_per_node", "Requests per node", requests_per_node);
+    }
 }
 
 pub struct Node {
     url: String,
     outstanding_requests: AtomicUsize,
+    requests: AtomicUsize,
     healthy: AtomicBool,
     weight: f64,
 }
@@ -220,11 +247,17 @@ impl Node {
         self.healthy.store(false, Ordering::Relaxed);
     }
 
-    pub fn in_use(&self) -> impl Drop + '_ {
-        self.outstanding_requests.fetch_add(1, Ordering::Relaxed);
-        scopeguard::guard(self, |n| {
-            n.outstanding_requests.fetch_sub(1, Ordering::Relaxed);
-        })
+    #[must_use]
+    pub fn in_use(&self, ctx: &Context) -> impl Sized + '_ {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        if ctx.is_least_requests_lb() {
+            self.outstanding_requests.fetch_add(1, Ordering::Relaxed);
+            Some(scopeguard::guard(self, |n| {
+                n.outstanding_requests.fetch_sub(1, Ordering::Relaxed);
+            }))
+        } else {
+            None
+        }
     }
 }
 

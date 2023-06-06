@@ -269,11 +269,7 @@ pub async fn request(
     mut retry_second: bool,
 ) -> Result<JsonBytes> {
     let response = loop {
-        let _in_use = if ctx.is_least_requests_lb() {
-            Some(node.in_use())
-        } else {
-            None
-        };
+        let _in_use = node.in_use(ctx);
         let result = ctx
             .client
             .post(node.url())
@@ -492,11 +488,7 @@ pub async fn cache_get_or_compute(
 }
 
 pub async fn get_tip_block_hash(ctx: &Context, node: &Node) -> Result<String> {
-    let _in_use = if ctx.is_least_requests_lb() {
-        Some(node.in_use())
-    } else {
-        None
-    };
+    let _in_use = node.in_use(ctx);
     let result = ctx
         .client
         .post(node.url())

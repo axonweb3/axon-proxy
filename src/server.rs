@@ -13,6 +13,7 @@ use axum::{
     routing::*,
     Json,
 };
+use prometheus_client::registry::Registry;
 use serde_json::{json, Map};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, timeout::TimeoutLayer};
@@ -51,8 +52,15 @@ async fn metrics_handler(State(ctx): State<SharedContext>) -> impl IntoResponse 
     let ctx = ctx.load();
     ctx.metrics.http_requests.inc();
 
-    let mut buf = String::with_capacity(2048);
-    if let Err(err) = prometheus_client::encoding::text::encode(&mut buf, &ctx.metrics_registry) {
+    // Create a new registry to encode the metrics. Unfortunately
+    // prometheus-client doesn't have a public encoding API like
+    // fn encode(w: impl Writer, desc: &Descriptor, metric: impl EncodeMetric).
+    let mut registry = Registry::default();
+    ctx.metrics.register(&mut registry);
+    ctx.register_self_metrics(&mut registry);
+
+    let mut buf = String::with_capacity(4096);
+    if let Err(err) = prometheus_client::encoding::text::encode(&mut buf, &registry) {
         log::warn!("failed to scrape metrics: {err}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
