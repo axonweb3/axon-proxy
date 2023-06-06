@@ -118,7 +118,6 @@ impl Context {
 
     pub fn get_rpc_node(&self, node: &str) -> Option<&Node> {
         let node = self.rpc_nodes.iter().find(|n| n.url == node)?;
-        node.outstanding_requests.fetch_add(1, Ordering::Relaxed);
         Some(node)
     }
 
