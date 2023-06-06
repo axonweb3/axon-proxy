@@ -183,7 +183,7 @@ pub async fn handle_single_request(
 
     // For filter methods, get node from redis. Otherwise choose an RPC node
     // with the configured method.
-    let (node, is_sticky) = if req.method == "eth_getFilterChanges"
+    let (node, is_sticky_or_hashing) = if req.method == "eth_getFilterChanges"
         || req.method == "eth_getFilterLogs"
         || req.method == "eth_uninstallFilter"
     {
@@ -210,7 +210,7 @@ pub async fn handle_single_request(
             }
         }
     } else {
-        (ctx.choose_rpc_node(ip), false)
+        (ctx.choose_rpc_node(ip), ctx.is_client_ip_hashing_lb())
     };
 
     if req.is_call() {
@@ -231,7 +231,14 @@ pub async fn handle_single_request(
     }
 
     // TODO: timeout?
-    let result = request(ctx, node, req_bytes.clone(), is_new_filter, !is_sticky).await;
+    let result = request(
+        ctx,
+        node,
+        req_bytes.clone(),
+        is_new_filter,
+        !is_sticky_or_hashing,
+    )
+    .await;
     if req.is_call() {
         Some(match result {
             Ok(v) => v,
@@ -457,7 +464,7 @@ pub async fn cache_get_or_compute(
         ctx.cache.expire_milliseconds,
         async {
             computed = true;
-            request(ctx, node, req_bytes, false, true)
+            request(ctx, node, req_bytes, false, false)
                 .await
                 .map(CacheValue)
                 .map_err(|e| {

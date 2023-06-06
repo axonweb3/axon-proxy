@@ -126,6 +126,10 @@ impl Context {
         matches!(self.lb, LB::P2cLeastRequests)
     }
 
+    pub fn is_client_ip_hashing_lb(&self) -> bool {
+        matches!(self.lb, LB::ClientIpHashing)
+    }
+
     pub fn choose_rpc_node(&self, ip: Ipv4Addr) -> &Node {
         match self.lb {
             LB::P2cLeastRequests => self.choose_rpc_node_p2c_least_requests(),
