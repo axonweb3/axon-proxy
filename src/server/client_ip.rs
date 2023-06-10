@@ -25,9 +25,9 @@ where
             .get_all("x-forwarded-for")
             .into_iter()
             .last()
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit_once(','))
-            .and_then(|(_, last)| last.trim().parse::<IpAddr>().ok())
+            .and_then(|v| v.as_bytes().rsplitn(2, |b| *b == b',').next())
+            .and_then(|last| std::str::from_utf8(last).ok())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok())
         {
             return Ok(Self(ip));
         }
@@ -83,12 +83,31 @@ mod tests {
 
         let ip2 = client
             .get(format!("http://127.0.0.1:{port}"))
-            .header("X-Forwarded-For", "1.3.5.7, 1.2.3.4")
+            .header("X-Forwarded-For", "1.2.3.4")
             .send()
             .await?
             .text()
             .await?;
         ensure!(ip2 == "1.2.3.4");
+
+        let ip3 = client
+            .get(format!("http://127.0.0.1:{port}"))
+            .header("X-Forwarded-For", "::1")
+            .send()
+            .await?
+            .text()
+            .await?;
+        ensure!(ip3 == "::1");
+
+        ensure!(std::str::from_utf8(b"\xff, 1.2.3.4").is_err());
+        let ip4 = client
+            .get(format!("http://127.0.0.1:{port}"))
+            .header("X-Forwarded-For", &b"\xff, 1.2.3.4"[..])
+            .send()
+            .await?
+            .text()
+            .await?;
+        ensure!(ip4 == "1.2.3.4");
 
         drop(handle);
         Ok(())
