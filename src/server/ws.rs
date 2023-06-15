@@ -67,12 +67,18 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
     let dead_timer = tokio::time::sleep(Duration::from_secs(60));
     tokio::pin!(dead_timer);
 
-    // TODO?: upstream keepalive. Maybe not necessary because upstream will ping us.
+    let upstream_dead_timer = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(upstream_dead_timer);
+
     let mut upstream = LazySocket { socket: None };
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(19));
     ping_interval.reset();
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut upstream_ping_interval = tokio::time::interval(Duration::from_secs(19));
+    upstream_ping_interval.reset();
+    upstream_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -110,6 +116,8 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                 }
             }
             msg = upstream.recv(), if upstream.is_connected() => {
+                upstream_dead_timer.as_mut().reset(Instant::now() + Duration::from_secs(60));
+                upstream_ping_interval.reset();
                 match msg {
                     Ok(Some(tungstenite::Message::Text(msg))) => {
                         if socket.send(msg.into()).await.is_err() {
@@ -142,6 +150,14 @@ async fn real_ws_handler(ctx: SharedContext, ip: IpAddr, mut socket: WebSocket) 
                 }
                 ctx.load().metrics.ws_message_sent.inc();
             }
+            _ = &mut upstream_dead_timer, if upstream.is_connected() => {
+                break;
+            }
+            _ = upstream_ping_interval.tick(), if upstream.is_connected() => {
+                if upstream.send(&ctx.load(), tungstenite::Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -165,7 +181,7 @@ async fn handle_ws_msg(
         }
         let mut results = Vec::with_capacity(reqs.len());
         for raw_req in &reqs {
-            let req_bytes = raw_req.get().to_string().into();
+            let req_bytes = msg.slice_ref(raw_req.get().as_bytes());
             if let Some(res) = handle_single_request(
                 ctx,
                 con.as_deref_mut(),
