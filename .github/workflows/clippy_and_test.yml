@@ -1,0 +1,20 @@
+name: Cargo Clippy and Test
+concurrency:
+  group: Cargo Clippy and Test-${{ github.ref }}
+  cancel-in-progress: true
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v3
+      - name: cargo-clippy
+        run: make clippy
+      - name: Test
+        run: docker run -d --name my-redis --network=host redis && make test

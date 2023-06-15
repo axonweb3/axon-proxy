@@ -1,8 +1,6 @@
-ERBOSE := $(if ${CI},--verbose,)
+VERBOSE := $(if ${CI},--verbose,)
 
 COMMIT := $(shell git rev-parse --short HEAD)
-
-CARGO := env ${SYS_ROCKSDB} cargo
 
 check-fmt:
 	cargo +nightly fmt ${VERBOSE} --all -- --check
@@ -11,8 +9,11 @@ fmt:
 	cargo +nightly fmt ${VERBOSE} --all
 
 clippy:
-	${CARGO} clippy ${VERBOSE} --all --all-targets --all-features -- \
+	cargo clippy ${VERBOSE} --locked --all --all-targets --all-features -- \
 		-D warnings -D clippy::enum_glob_use
+
+test:
+	cargo test ${VERBOSE} --all --all-targets
 
 sort:
 	cargo sort -gw
