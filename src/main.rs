@@ -5,11 +5,11 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwap;
-use clap::Parser;
-use my_proxy::{
+use axon_proxy::{
     config::Config,
     context::{Context, SharedContext},
 };
+use clap::Parser;
 use tokio::signal::unix::SignalKind;
 
 #[global_allocator]
@@ -17,9 +17,9 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 struct ProxyArgs {
-    #[clap(short, long, env = "MY_PROXY_CONFIG_FILE")]
+    #[clap(short, long, env = "AXON_PROXY_CONFIG_FILE")]
     config: PathBuf,
-    #[clap(long, env = "MY_PROXY_THREADS")]
+    #[clap(long, env = "AXON_PROXY_THREADS")]
     threads: Option<usize>,
 }
 
@@ -47,7 +47,7 @@ async fn real_main(config: Config, config_path: PathBuf) -> Result<()> {
         }
     });
 
-    my_proxy::server::serve(context).await?;
+    axon_proxy::server::serve(context).await?;
 
     Ok(())
 }

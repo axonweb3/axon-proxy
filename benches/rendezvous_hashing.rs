@@ -1,5 +1,5 @@
+use axon_proxy::rendezvous_hashing::*;
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use my_proxy::rendezvous_hashing::*;
 use siphasher::sip::SipHasher;
 
 criterion_group!(benches, criterion_benchmark);

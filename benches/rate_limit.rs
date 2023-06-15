@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
+use axon_proxy::redis::rate_limit::rate_limit;
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use my_proxy::redis::rate_limit::rate_limit;
 use rand::{thread_rng, Rng};
 
 criterion_group!(benches, criterion_benchmark);

@@ -1,3 +1,3 @@
 FROM gcr.io/distroless/cc
-COPY target/release/my-proxy /
-ENTRYPOINT ["/my-proxy"]
+COPY target/release/axon-proxy /
+ENTRYPOINT ["/axon-proxy"]
