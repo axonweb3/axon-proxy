@@ -24,13 +24,13 @@ A dockerfile is also provided.
 # Running
 
 ```command
-$ my-proxy -c config.toml
+$ axon-proxy -c config.toml
 ```
 
-Specify the number of worker threads with `--threads` or `MY_PROXY_THREADS`:
+Specify the number of worker threads with `--threads` or `AXON_PROXY_THREADS`:
 
 ```command
-$ my-proxy --threads 8 -c config.toml
+$ axon-proxy --threads 8 -c config.toml
 ```
 
 The default is to use the same number of threads as the number of CPU cores.
