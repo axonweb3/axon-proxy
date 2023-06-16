@@ -138,6 +138,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
+name = "axon-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "blake3",
+ "clap 4.3.0",
+ "criterion",
+ "deadpool-redis",
+ "env_logger",
+ "fastrand",
+ "futures",
+ "itertools",
+ "jsonrpsee-types",
+ "log",
+ "mimalloc",
+ "once_cell",
+ "prometheus-client",
+ "rand",
+ "redis",
+ "reqwest",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "siphasher",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tower",
+ "tower-http",
+]
+
+[[package]]
 name = "axum"
 version = "0.6.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,42 +1055,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.45.0",
-]
-
-[[package]]
-name = "my-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "axum",
- "blake3",
- "clap 4.3.0",
- "criterion",
- "deadpool-redis",
- "env_logger",
- "fastrand",
- "futures",
- "itertools",
- "jsonrpsee-types",
- "log",
- "mimalloc",
- "once_cell",
- "prometheus-client",
- "rand",
- "redis",
- "reqwest",
- "scopeguard",
- "serde",
- "serde_json",
- "siphasher",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tower",
- "tower-http",
 ]
 
 [[package]]
