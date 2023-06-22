@@ -146,8 +146,12 @@ impl Context {
         let two: [&Node; 2] = match healthy.len() {
             0 => {
                 // No healthy nodes, pick from unhealthy.
-                let [idx0, idx1] = random_two_indexes(self.rpc_nodes.len());
-                [&self.rpc_nodes[idx0], &self.rpc_nodes[idx1]]
+                if self.rpc_nodes.len() > 1 {
+                    let [idx0, idx1] = random_two_indexes(self.rpc_nodes.len());
+                    [&self.rpc_nodes[idx0], &self.rpc_nodes[idx1]]
+                } else {
+                    return &self.rpc_nodes[0];
+                }
             }
             1 => return healthy[0],
             2 => healthy[..].try_into().unwrap(),
@@ -357,5 +361,27 @@ async fn health_check(ctx: Weak<Context>) {
             })
             .await;
         tokio::time::sleep(Duration::from_secs(ctx.health_check.interval_secs.into())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_p2c_lb_single_unhealthy() {
+        let config = toml::from_str(
+            r#"
+bind = 8000
+redis.url = "redis://127.0.0.1/"
+
+[[nodes]]
+url = "http://127.0.0.1:3000/"
+"#,
+        )
+        .unwrap();
+        let ctx = Context::from_config_inner(config).unwrap();
+        ctx.rpc_nodes[0].healthy.store(false, Ordering::Relaxed);
+        ctx.choose_rpc_node(0.into());
     }
 }
