@@ -55,6 +55,7 @@ mod tests {
         ip.0.to_string()
     }
 
+    #[allow(invalid_from_utf8)]
     #[tokio::test]
     async fn test_my_secure_client_ip() -> Result<()> {
         let svc = axum::Router::new()

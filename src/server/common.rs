@@ -53,7 +53,7 @@ pub fn error_response<Id: Serialize>(id: Id, code: i32, message: &str) -> JsonBy
     serde_json::to_vec(&ErrResponse {
         jsonrpc: TwoPointZero,
         id,
-        error: ErrorObject::borrowed(code, &message, None),
+        error: ErrorObject::borrowed(code, message, None),
     })
     .unwrap()
     .into()
