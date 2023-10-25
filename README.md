@@ -5,11 +5,18 @@ A reverse proxy / load balancer for axon.
 - HTTP and WebSocket. Subscription is supported on WebSocket connections.
 - P2C least requests or client ip consistent hashing load balancing.
 - Filter id sticky load balancing.
+
+  E.g. an `eth_getFilterChanges` request will be forwarded to the node that creates the filter.
+
 - Health check and failover.
-- Per-ip (and per-ip-per-method) rate limiting with redis.
-- Caching with redis.
+- Per-ip (and per-ip-per-method) JSONRPC rate limiting with redis.
+- JSONRPC caching with redis.
 - High availability: running multiple instances of this proxy is supported.
 - Metrics.
+
+# Not Planned
+
+Features like https, http/2, http/3 or more complicated CORS configurations. These should be supported by a dedicated http proxy in front of axon-proxy if necessary.
 
 # Building
 
