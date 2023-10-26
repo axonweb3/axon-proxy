@@ -338,7 +338,7 @@ impl Metrics {
 ///
 /// If len < 2.
 fn random_two_indexes(len: usize) -> [usize; 2] {
-    let rng = fastrand::Rng::new();
+    let mut rng = fastrand::Rng::new();
     let idx0 = rng.usize(0..len - 1);
     let mut idx1 = rng.usize(0..len);
     if idx1 == idx0 {

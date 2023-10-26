@@ -30,9 +30,8 @@ pub async fn ws_handler(
     ClientIp(ip): ClientIp,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.max_send_queue(8)
-        // 2MB, same as http body limit.
-        .max_message_size(2 * 1024 * 1024)
+    // 2MB, same as http body limit.
+    ws.max_message_size(2 * 1024 * 1024)
         .on_upgrade(move |socket| real_ws_handler(ctx, ip, socket))
 }
 
